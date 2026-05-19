@@ -1,0 +1,30 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="numpy" />
+          <option value="pandas" />
+          <option value="matplotlib" />
+          <option value="seaborn" />
+          <option value="scikit-learn" />
+          <option value="torch" />
+          <option value="torchvision" />
+          <option value="torchaudio" />
+          <option value="wfdb" />
+          <option value="jupyter" />
+          <option value="notebook" />
+          <option value="ipykernel" />
+          <option value="tqdm" />
+          <option value="python-dateutil" />
+          <option value="fastapi" />
+          <option value="uvicorn" />
+          <option value="pydantic" />
+          <option value="python-multipart" />
+          <option value="requests" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>

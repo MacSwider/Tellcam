@@ -1,0 +1,38 @@
+{
+  "pipeline": {
+    "control_hz": 30,
+    "detection_hz_top": 12,
+    "detection_hz_side": 12,
+    "preview_hz": 30,
+    "show_detection_overlay": true
+  },
+  "cameras": {
+    "index_ceiling": 0,
+    "index_side": 1,
+    "width": 640,
+    "height": 480,
+    "buffer_size": 1,
+    "drain_frames_on_read": 2
+  },
+  "aruco": {
+    "dictionary_name": "DICT_4X4_50",
+    "marker_ids": [0, 1, 2, 3, 4],
+    "marker_length_m": 0.02,
+    "use_aruco3_detection": true,
+    "use_template_fallback": true,
+    "template_match_threshold": 0.38,
+    "max_detection_width": 640,
+    "max_markers_per_frame": 5,
+    "intrinsics_from_frame_size": true
+  },
+  "controller": {
+    "pid_x": { "kp": 0.8, "ki": 0.02, "kd": 0.15 },
+    "pid_y": { "kp": 0.8, "ki": 0.02, "kd": 0.15 },
+    "pid_z": { "kp": 1.2, "ki": 0.05, "kd": 0.2 },
+    "pid_yaw": { "kp": 0.5, "ki": 0.01, "kd": 0.1 }
+  },
+  "target": { "x_m": 0.0, "y_m": 0.0, "z_m": 1.0, "yaw_rad": 0.0 },
+  "failsafe": { "max_lost_frames": 15, "on_lost_send_zero_rc": true },
+  "debug_windows": true,
+  "control_enabled": false
+}
