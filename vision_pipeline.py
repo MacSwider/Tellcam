@@ -1,9 +1,9 @@
 """
-Wielowątkowy pipeline wizji Tellcam: kamery, detekcja ArUco, sterowanie, podgląd.
+Wielowątkowy pipeline wizji Tellcam: kamery, detekcja AprilTag, sterowanie, podgląd.
 
 - CameraReader: tylko read() @ max FPS, nadpisuje najnowszą klatkę
-- ArucoDetectionWorker: detekcja @ stałej częstotliwości na najświeższej klatce
-- ControlLoop (wątek główny): PID / fuzja @ control_hz, bez ArUco
+- AprilTagDetectionWorker: detekcja @ stałej częstotliwości na najświeższej klatce
+- ControlLoop (wątek główny): PID / fuzja @ control_hz, bez detekcji tagów
 - PreviewGUI: podgląd @ preview_hz, bez detekcji
 """
 from __future__ import annotations
@@ -18,8 +18,8 @@ from typing import Callable, List, Optional, Tuple, Union
 import cv2
 import numpy as np
 
-from aruco_detector import (
-    ArucoDetector,
+from apriltag_detector import (
+    AprilTagDetector,
     MarkerOverlay,
     SideCorrectionObservation,
     TopPoseObservation,
@@ -218,11 +218,8 @@ class CameraReader(threading.Thread):
             self._source.close()
 
 
-class ArucoDetectionWorker(threading.Thread):
-    """
-    Wątek detekcji: stała częstotliwość, zawsze najświeższa klatka z CameraReader.
-    Alias specyfikacji: ArucoDetectorThread (unika kolizji z aruco_detector.ArucoDetector).
-    """
+class AprilTagDetectionWorker(threading.Thread):
+    """Wątek detekcji: stała częstotliwość, zawsze najświeższa klatka z CameraReader."""
 
     def __init__(
         self,
@@ -230,7 +227,7 @@ class ArucoDetectionWorker(threading.Thread):
         camera_id: str,
         detection_hz: float,
         shared: VisionSharedState,
-        aruco_cfg,
+        apriltag_cfg,
         camera_cfg: CameraConfig,
         *,
         mode: str,
@@ -243,7 +240,7 @@ class ArucoDetectionWorker(threading.Thread):
         self._mode = mode
         self._period = 1.0 / max(float(detection_hz), 0.1)
         self._shared = shared
-        self._detector = ArucoDetector(aruco_cfg, camera_cfg)
+        self._detector = AprilTagDetector(apriltag_cfg, camera_cfg)
         self.detection_count = 0
         self.detection_hz = 0.0
 
@@ -260,7 +257,7 @@ class ArucoDetectionWorker(threading.Thread):
             self._shared.publish_side_pose(obs)  # type: ignore[arg-type]
 
     def run(self) -> None:
-        log.info("[%s] ArucoDetectionWorker start @ %.1f Hz", self.name, 1.0 / self._period)
+        log.info("[%s] AprilTagDetectionWorker start @ %.1f Hz", self.name, 1.0 / self._period)
         fps_n = 0
         fps_t0 = time.perf_counter()
         try:
@@ -283,13 +280,13 @@ class ArucoDetectionWorker(threading.Thread):
                     fps_n = 0
                     fps_t0 = now
         except Exception:
-            log.exception("[%s] ArucoDetectionWorker błąd", self.name)
+            log.exception("[%s] AprilTagDetectionWorker błąd", self.name)
         finally:
-            log.info("[%s] ArucoDetectionWorker stop (detections=%s)", self.name, self.detection_count)
+            log.info("[%s] AprilTagDetectionWorker stop (detections=%s)", self.name, self.detection_count)
 
 
 class ControlLoop:
-    """Pętla sterowania @ control_hz — bez ArUco, tylko odczyt pozy ze współdzielonego stanu."""
+    """Pętla sterowania @ control_hz — tylko odczyt pozy ze współdzielonego stanu."""
 
     def __init__(
         self,
@@ -298,8 +295,8 @@ class ControlLoop:
         estimator: StateEstimator,
         *,
         on_tick: Optional[Callable[[DroneState, TopPoseObservation, SideCorrectionObservation, float], List[str]]] = None,
-        top_detection: Optional[ArucoDetectionWorker] = None,
-        side_detection: Optional[ArucoDetectionWorker] = None,
+        top_detection: Optional[AprilTagDetectionWorker] = None,
+        side_detection: Optional[AprilTagDetectionWorker] = None,
         top_camera: Optional[CameraReader] = None,
         side_camera: Optional[CameraReader] = None,
     ) -> None:
@@ -554,8 +551,8 @@ class VisionPipeline:
     shared: VisionSharedState
     top_camera: CameraReader
     side_camera: CameraReader
-    top_detection: ArucoDetectionWorker
-    side_detection: ArucoDetectionWorker
+    top_detection: AprilTagDetectionWorker
+    side_detection: AprilTagDetectionWorker
     control: ControlLoop
     preview: Optional[PreviewGUI] = None
 
@@ -598,21 +595,21 @@ def build_vision_pipeline(
     shared = VisionSharedState()
     top_camera = CameraReader("TopCamera", TOP, top_source_factory, shared)
     side_camera = CameraReader("SideCamera", SIDE, side_source_factory, shared)
-    top_detection = ArucoDetectionWorker(
-        "TopAruco",
+    top_detection = AprilTagDetectionWorker(
+        "TopAprilTag",
         TOP,
         pipeline_cfg.detection_hz_top,
         shared,
-        cfg.aruco,
+        cfg.apriltag,
         cfg.cameras,
         mode=TOP,
     )
-    side_detection = ArucoDetectionWorker(
-        "SideAruco",
+    side_detection = AprilTagDetectionWorker(
+        "SideAprilTag",
         SIDE,
         pipeline_cfg.detection_hz_side,
         shared,
-        cfg.aruco,
+        cfg.apriltag,
         cfg.cameras,
         mode=SIDE,
     )
@@ -647,5 +644,6 @@ def build_vision_pipeline(
     )
 
 
-# Alias zgodny ze specyfikacją architektury (wątek detekcji, nie klasa ArucoDetector)
-ArucoDetectorThread = ArucoDetectionWorker
+# Alias wsteczny (stara nazwa wątku detekcji)
+ArucoDetectionWorker = AprilTagDetectionWorker
+ArucoDetectorThread = AprilTagDetectionWorker

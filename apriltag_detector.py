@@ -1,4 +1,4 @@
-"""Detekcja wielu markerów ArUco (ID 0–4) — pozycja i orientacja drona (TOP + SIDE)."""
+"""Detekcja AprilTag tag36h11 (ID 0–4) — pozycja i orientacja drona (TOP + SIDE)."""
 from __future__ import annotations
 
 import json
@@ -9,7 +9,7 @@ from typing import Dict, Iterable, Optional, Tuple
 import cv2
 import numpy as np
 
-from config import ArucoConfig, CameraConfig
+from config import AprilTagConfig, CameraConfig
 from fiducial_detector import FiducialDetection, FiducialDetector
 
 # Układ od góry (oś X = przód, Y = lewo):
@@ -59,13 +59,7 @@ class _MarkerPose:
     rvec: np.ndarray
     tvec: np.ndarray
     corners: np.ndarray
-    dictionary_name: str
-
-
-def _get_dictionary(name: str):
-    if not hasattr(cv2.aruco, name):
-        raise ValueError(f"Nieznany słownik ArUco: {name}")
-    return cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, name))
+    family: str
 
 
 def _default_intrinsics(w: int, h: int, fov_deg: float = 58.0) -> Tuple[np.ndarray, np.ndarray]:
@@ -120,26 +114,59 @@ def _marker_corners_object_points(center_xyz: np.ndarray, half_side_m: float) ->
     )
 
 
-class ArucoDetector:
-    def __init__(self, ar_cfg: ArucoConfig, cam_cfg: CameraConfig) -> None:
-        self._ar = ar_cfg
+def _single_marker_object_points(marker_length_m: float) -> np.ndarray:
+    half = float(marker_length_m) * 0.5
+    return np.array(
+        [
+            [-half, half, 0.0],
+            [half, half, 0.0],
+            [half, -half, 0.0],
+            [-half, -half, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _estimate_marker_pose(
+    corners: np.ndarray,
+    marker_length_m: float,
+    camera_matrix: np.ndarray,
+    dist: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    img_pts = corners.reshape(4, 2).astype(np.float64)
+    obj_pts = _single_marker_object_points(marker_length_m)
+    ok, rvec, tvec = cv2.solvePnP(
+        obj_pts,
+        img_pts,
+        camera_matrix,
+        dist,
+        flags=cv2.SOLVEPNP_IPPE_SQUARE,
+    )
+    if not ok:
+        return None
+    return rvec.reshape(3), tvec.reshape(3)
+
+
+class AprilTagDetector:
+    def __init__(self, tag_cfg: AprilTagConfig, cam_cfg: CameraConfig) -> None:
+        self._tag = tag_cfg
         self._cam = cam_cfg
-        self._fiducial = FiducialDetector(ar_cfg)
-        self._half_marker = float(ar_cfg.marker_length_m) * 0.5
+        self._fiducial = FiducialDetector(tag_cfg)
+        self._half_marker = float(tag_cfg.marker_length_m) * 0.5
         self._body_centers = self._build_body_centers()
-        self._allowed_ids = set(int(x) for x in ar_cfg.marker_ids)
-        if ar_cfg.calibration_path:
-            self._K, self._dist = _load_intrinsics(ar_cfg.calibration_path, cam_cfg.width, cam_cfg.height)
+        self._allowed_ids = set(int(x) for x in tag_cfg.marker_ids)
+        if tag_cfg.calibration_path:
+            self._K, self._dist = _load_intrinsics(tag_cfg.calibration_path, cam_cfg.width, cam_cfg.height)
         else:
             self._K, self._dist = _default_intrinsics(cam_cfg.width, cam_cfg.height)
         self._frame_K_wh: Tuple[int, int] | None = None
-        self._active_dictionary_name = ar_cfg.dictionary_name
+        self._active_family = tag_cfg.family
         self._detection_mode = "none"
 
     def _build_body_centers(self) -> Dict[int, np.ndarray]:
-        hf = float(self._ar.layout_half_forward_m)
-        hl = float(self._ar.layout_half_lateral_m)
-        sz = float(self._ar.marker_side_height_m)
+        hf = float(self._tag.layout_half_forward_m)
+        hl = float(self._tag.layout_half_lateral_m)
+        sz = float(self._tag.marker_side_height_m)
         return {
             0: np.array([0.0, 0.0, 0.0]),
             1: np.array([hf, hl, -sz]),
@@ -150,15 +177,14 @@ class ArucoDetector:
 
     def _dict_hint(self) -> str:
         return (
-            f"Słownik: {self._active_dictionary_name}. "
-            "Wydruk: python generate_aruco_markers.py (ten sam słownik co w config). "
+            f"Rodzina: {self._active_family}. "
             f"Oczekiwane ID: {sorted(self._allowed_ids)}."
         )
 
     def _ensure_intrinsics(self, w: int, h: int) -> None:
-        if self._ar.calibration_path:
+        if self._tag.calibration_path:
             return
-        if self._ar.intrinsics_from_frame_size and self._frame_K_wh != (w, h):
+        if self._tag.intrinsics_from_frame_size and self._frame_K_wh != (w, h):
             self._K, self._dist = _default_intrinsics(w, h)
             self._frame_K_wh = (w, h)
 
@@ -177,10 +203,10 @@ class ArucoDetector:
         overlays: list[MarkerOverlay] = []
 
         if len(det.ids) == 0:
-            return poses, all_seen, ()
+            return poses, all_seen, tuple(overlays)
 
         corners, ids = det.corners, det.ids
-        dict_name = self._active_dictionary_name
+        family = self._active_family
 
         for i, mid in enumerate(ids.flatten()):
             marker_id = int(mid)
@@ -194,19 +220,19 @@ class ArucoDetector:
             )
             if marker_id not in self._allowed_ids:
                 continue
-            c = [corners[i]]
-            rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-                c, self._ar.marker_length_m, self._K, self._dist
+            pose = _estimate_marker_pose(
+                corners[i], self._tag.marker_length_m, self._K, self._dist
             )
-            rvec = rvecs[0].reshape(3)
-            tvec = tvecs[0].reshape(3)
+            if pose is None:
+                continue
+            rvec, tvec = pose
             poses.append(
                 _MarkerPose(
                     id=marker_id,
                     rvec=rvec,
                     tvec=tvec,
                     corners=corners[i],
-                    dictionary_name=dict_name,
+                    family=family,
                 )
             )
 
@@ -286,10 +312,11 @@ class ArucoDetector:
         base = self._dict_hint()
         if all_seen:
             return (
-                f"Wykryto inne ID: {all_seen} (nie 0–4) — prawdopodobnie zły słownik lub fałszywe trafienia. {base}"
+                f"Wykryto inne ID: {all_seen} (nie 0–4) — prawdopodobnie zła rodzina lub fałszywe trafienia. {base}"
             )
+        mm = int(round(self._tag.marker_length_m * 1000))
         return (
-            f"Brak markerów 0–4. Sprawdź ostrość, światło, rozmiar (20 mm) i słownik. {base}"
+            f"Brak tagów 0–4. Sprawdź ostrość, światło i rozmiar czarnego kwadratu ({mm} mm, bez ramki). {base}"
         )
 
     def detect_top_pose(self, frame_bgr: Optional[np.ndarray]) -> TopPoseObservation:
@@ -340,7 +367,7 @@ class ArucoDetector:
                 roll_rad=roll,
                 markers_seen=seen,
                 marker_overlays=overlays,
-                hint=f"TOP: za mało markerów ({seen}). Potrzebny ID 0 lub ≥2 ID.",
+                hint=f"TOP: za mało tagów ({seen}). Potrzebny ID 0 lub ≥2 ID.",
             )
 
         return TopPoseObservation(

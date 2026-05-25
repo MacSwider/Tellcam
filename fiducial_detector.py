@@ -1,8 +1,8 @@
 """
-Detekcja markerów ArUco — podejście jak w ROS / fiducial:
-  1) OpenCV ArUco3 (detectInvertedMarker, wieloprzebiegowy)
-  2) Dopasowanie szablonu NCC (białe wzory na ciemnym tle)
-  3) Walidacja geometryczna znanych ID 0–4
+Detekcja markerów AprilTag (rodzina tag36h11) — pupil_apriltags:
+  wieloprzebiegowy (CLAHE / histogram), skalowanie dla małych klatek,
+  fallback dla naklejek bez białej ramki (wycięcie czarnego kwadratu + pad),
+  filtr ID 0–4, deduplikacja i walidacja geometryczna układu.
 """
 from __future__ import annotations
 
@@ -10,91 +10,116 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
+from pupil_apriltags import Detector
 
-from config import ArucoConfig
+from config import AprilTagConfig
 
 
 @dataclass
 class FiducialDetection:
-    corners: list  # list of (1,4,2) float32
+    corners: list  # list of (1,4,2) float32 — kolejność zgodna z OpenCV solvePnP
     ids: np.ndarray  # (N,1) int32
-    method: str  # aruco3 | template | none
+    method: str  # apriltag | apriltag_crop | none
 
 
-def _get_dictionary(name: str) -> cv2.aruco.Dictionary:
-    if not hasattr(cv2.aruco, name):
-        raise ValueError(f"Nieznany słownik ArUco: {name}")
-    return cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, name))
+def _corners_to_opencv_order(corners: np.ndarray) -> np.ndarray:
+    c = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+    return c.reshape(1, 4, 2)
 
 
-def _make_aruco_params(ar_cfg: ArucoConfig) -> cv2.aruco.DetectorParameters:
-    p = cv2.aruco.DetectorParameters()
-    p.adaptiveThreshWinSizeMin = 3
-    p.adaptiveThreshWinSizeMax = 33
-    p.adaptiveThreshWinSizeStep = 8
-    p.minMarkerPerimeterRate = float(ar_cfg.min_marker_perimeter_rate)
-    p.maxMarkerPerimeterRate = 4.0
-    p.minCornerDistanceRate = 0.05
-    p.minDistanceToBorder = 3
-    p.errorCorrectionRate = 0.5
-    p.detectInvertedMarker = True
-    if hasattr(p, "useAruco3Detection"):
-        p.useAruco3Detection = bool(ar_cfg.use_aruco3_detection)
-    refine = getattr(cv2.aruco, "CORNER_REFINE_APRILTAG", cv2.aruco.CORNER_REFINE_SUBPIX)
-    p.cornerRefinementMethod = refine
-    return p
-
-
-def _gray_variants(gray: np.ndarray, ar_cfg: ArucoConfig) -> list[np.ndarray]:
+def _gray_variants(gray: np.ndarray, tag_cfg: AprilTagConfig) -> list[np.ndarray]:
     out: list[np.ndarray] = [gray]
-    if ar_cfg.use_clahe:
+    if tag_cfg.use_clahe:
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         out.append(clahe.apply(gray))
-    eq = cv2.equalizeHist(gray)
-    out.append(eq)
+    out.append(cv2.equalizeHist(gray))
     return out
 
 
+def _extract_black_tag_patch(
+    gray: np.ndarray,
+    thresh: int,
+    pad_frac: float,
+    *,
+    max_area_frac: float = 0.35,
+    min_area_frac: float = 0.002,
+) -> tuple[np.ndarray, int, int, int, int, int, int] | None:
+    """
+    Wyodrębnia ciemny kwadrat tagu (bez czerwonej podkładki) i dodaje białą ramkę.
+    Zwraca: patch, x0, y0, bw, bh, pad_px, upscale_factor.
+    """
+    _, black = cv2.threshold(gray, int(thresh), 255, cv2.THRESH_BINARY_INV)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    black = cv2.morphologyEx(black, cv2.MORPH_OPEN, k)
+    black = cv2.morphologyEx(black, cv2.MORPH_CLOSE, k)
+    cnts, _ = cv2.findContours(black, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+
+    img_area = float(gray.shape[0] * gray.shape[1])
+    max_area = img_area * max_area_frac
+    min_area = max(900.0, img_area * min_area_frac)
+    best_score = 0.0
+    best_rect: tuple[int, int, int, int] | None = None
+
+    for c in cnts:
+        area = float(cv2.contourArea(c))
+        if area < min_area or area > max_area:
+            continue
+        x0, y0, bw, bh = cv2.boundingRect(c)
+        if bw < 20 or bh < 20:
+            continue
+        aspect = bw / float(bh)
+        if aspect < 0.55 or aspect > 1.8:
+            continue
+        fill = area / float(bw * bh)
+        if fill < 0.35:
+            continue
+        score = area * min(aspect, 1.0 / aspect) * fill
+        if score > best_score:
+            best_score = score
+            best_rect = (x0, y0, bw, bh)
+
+    if best_rect is None:
+        return None
+
+    x0, y0, bw, bh = best_rect
+    pad_px = max(12, int(max(bw, bh) * pad_frac))
+    roi = gray[y0 : y0 + bh, x0 : x0 + bw]
+    patch = cv2.copyMakeBorder(roi, pad_px, pad_px, pad_px, pad_px, cv2.BORDER_CONSTANT, value=255)
+    return patch, x0, y0, bw, bh, pad_px, 2
+
+
+def _remap_corners_from_patch(
+    corners: np.ndarray,
+    x0: int,
+    y0: int,
+    pad_px: int,
+    upscale: int,
+) -> np.ndarray:
+    c = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+    inv = 1.0 / float(upscale)
+    c = c * inv - float(pad_px)
+    c[:, 0] += float(x0)
+    c[:, 1] += float(y0)
+    return c.reshape(1, 4, 2)
+
+
 class FiducialDetector:
-    """Jeden backend na klatkę — ArUco3 + szablony + limit ID."""
+    """Backend detekcji AprilTag na klatkę."""
 
-    def __init__(self, ar_cfg: ArucoConfig) -> None:
-        self._ar = ar_cfg
-        self._dict_name = ar_cfg.dictionary_name
-        self._dictionary = _get_dictionary(self._dict_name)
-        self._params = _make_aruco_params(ar_cfg)
-        self._aruco = cv2.aruco.ArucoDetector(self._dictionary, self._params)
-        self._allowed = sorted(int(x) for x in ar_cfg.marker_ids)
+    def __init__(self, tag_cfg: AprilTagConfig) -> None:
+        self._tag = tag_cfg
+        self._allowed = sorted(int(x) for x in tag_cfg.marker_ids)
         self._allowed_set = set(self._allowed)
-        self._templates = self._build_ncc_templates()
-        self._body_xy = self._marker_centers_xy()
-
-    @staticmethod
-    def _marker_centers_xy() -> dict[int, tuple[float, float]]:
-        hf, hl = 0.07, 0.07
-        return {
-            0: (0.0, 0.0),
-            1: (hf, hl),
-            2: (hf, -hl),
-            3: (-hf, -hl),
-            4: (-hf, hl),
-        }
-
-    def _build_ncc_templates(self) -> list[tuple[int, np.ndarray]]:
-        base = 80
-        scales = tuple(float(s) for s in self._ar.template_match_scales)
-        out: list[tuple[int, np.ndarray]] = []
-        for mid in self._allowed:
-            try:
-                inner = cv2.aruco.generateImageMarker(self._dictionary, mid, base, borderBits=1)
-            except cv2.error:
-                continue
-            white_on_black = (255 - inner).astype(np.uint8)
-            for s in scales:
-                side = max(20, int(round(base * s)))
-                tpl = cv2.resize(white_on_black, (side, side), interpolation=cv2.INTER_AREA)
-                out.append((mid, tpl))
-        return out
+        self._detector = Detector(
+            families=tag_cfg.family,
+            nthreads=1,
+            quad_decimate=float(tag_cfg.quad_decimate),
+            quad_sigma=float(tag_cfg.quad_sigma),
+            refine_edges=1 if tag_cfg.refine_edges else 0,
+            decode_sharpening=float(tag_cfg.decode_sharpening),
+        )
 
     def _filter_allowed(
         self, corners: list | None, ids: np.ndarray | None
@@ -120,14 +145,13 @@ class FiducialDetector:
             area = float(cv2.contourArea(c))
             if mid not in best or area > best[mid][1]:
                 best[mid] = (corners[i], area)
-        cap = max(1, int(self._ar.max_markers_per_frame))
+        cap = max(1, int(self._tag.max_markers_per_frame))
         ranked = sorted(best.items(), key=lambda x: x[1][1], reverse=True)[:cap]
         out_c = [x[1][0] for x in ranked]
         out_ids = np.array([[x[0]] for x in ranked], dtype=np.int32)
         return out_c, out_ids
 
     def _validate_layout(self, corners: list, ids: np.ndarray) -> tuple[list, np.ndarray]:
-        """Odrzuca trafienia sprzeczne z typowym rozmiarem markera na dronie."""
         if len(ids) < 2:
             return corners, ids
         centers: dict[int, np.ndarray] = {}
@@ -148,102 +172,116 @@ class FiducialDetector:
                 continue
             keep_ids.append(mid)
             keep_c.append(corners[i])
-        if len(keep_ids) >= 2:
-            d01 = np.linalg.norm(centers.get(0, centers[keep_ids[0]]) - centers.get(1, centers[keep_ids[1]]))
-            for a, b in ((1, 2), (0, 3)):
-                if a in centers and b in centers:
-                    d = float(np.linalg.norm(centers[a] - centers[b]))
-                    if d01 > 10 and d > d01 * 4.5:
-                        pass
         if not keep_ids:
             return corners, ids
         return keep_c, np.array([[x] for x in keep_ids], dtype=np.int32)
 
-    def _detect_aruco3(self, gray: np.ndarray) -> tuple[list, np.ndarray]:
+    def _collect_detections(
+        self,
+        gray: np.ndarray,
+        margin_thr: float,
+        remap: tuple[int, int, int, int] | None = None,
+    ) -> tuple[list, list[int]]:
+        """Zbierz trafienia z bieżącej skali obrazu (opcjonalnie z patch → pełna klatka)."""
+        corners: list = []
+        ids_list: list[int] = []
+        detections = self._detector.detect(gray)
+        for det in detections:
+            if det.decision_margin is not None and float(det.decision_margin) < margin_thr:
+                continue
+            mid = int(det.tag_id)
+            if mid not in self._allowed_set:
+                continue
+            c = _corners_to_opencv_order(det.corners)
+            if remap is not None:
+                x0, y0, pad_px, upscale = remap
+                c = _remap_corners_from_patch(c, x0, y0, pad_px, upscale)
+            corners.append(c)
+            ids_list.append(mid)
+        return corners, ids_list
+
+    def _detect_apriltag(self, gray: np.ndarray) -> tuple[list, np.ndarray, str]:
         best_c: list = []
         best_ids = np.empty((0, 1), dtype=np.int32)
         best_n = 0
+        method = "none"
         h, w = gray.shape[:2]
         scales = [1.0]
         if min(h, w) < 280:
             scales.append(2.0)
+        margin_thr = float(self._tag.min_decision_margin)
+
         for scale in scales:
             g = gray if scale == 1.0 else cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
             inv = 1.0 / scale
-            for variant in _gray_variants(g, self._ar):
-                corners, ids, _ = self._aruco.detectMarkers(variant)
-                corners, ids = self._filter_allowed(corners, ids)
-                if len(ids) > best_n:
-                    best_n = len(ids)
-                    if scale != 1.0 and corners:
-                        scaled_c = []
-                        for c in corners:
-                            c2 = np.array(c, dtype=np.float32, copy=True)
-                            c2 *= inv
-                            scaled_c.append(c2)
-                        best_c, best_ids = scaled_c, ids
+            for variant in _gray_variants(g, self._tag):
+                corners, ids_list = self._collect_detections(variant, margin_thr)
+                if not ids_list:
+                    continue
+                ids_arr = np.array([[x] for x in ids_list], dtype=np.int32)
+                if len(ids_list) > best_n:
+                    best_n = len(ids_list)
+                    if scale != 1.0:
+                        scaled_c = [np.array(c, dtype=np.float32) * inv for c in corners]
+                        best_c, best_ids = scaled_c, ids_arr
                     else:
-                        best_c, best_ids = list(corners), ids
+                        best_c, best_ids = corners, ids_arr
+                    method = "apriltag"
                 if best_n >= 2:
-                    break
+                    return best_c, best_ids, method
             if best_n >= 2:
-                break
-        return best_c, best_ids
+                return best_c, best_ids, method
 
-    def _detect_template_ncc(self, gray: np.ndarray) -> tuple[list, np.ndarray]:
-        gh, gw = gray.shape[:2]
-        thr = float(self._ar.template_match_threshold)
-        margin = float(self._ar.template_match_margin)
-        per_id: dict[int, tuple[float, int, int, int, int]] = {}
+        if best_n > 0:
+            return best_c, best_ids, method
 
-        for mid, tpl in self._templates:
-            th, tw = tpl.shape[:2]
-            if th > gh or tw > gw:
-                continue
-            res = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
-            _, peak, _, (px, py) = cv2.minMaxLoc(res)
-            prev = per_id.get(mid)
-            if prev is None or peak > prev[0]:
-                per_id[mid] = (float(peak), px, py, tw, th)
+        if not self._tag.use_black_crop_fallback:
+            return best_c, best_ids, method
 
-        if not per_id:
-            return [], np.empty((0, 1), dtype=np.int32)
+        pad_frac = float(self._tag.black_crop_pad_frac)
+        upscale = max(1, int(self._tag.black_crop_upscale))
+        thresholds = tuple(int(t) for t in self._tag.black_crop_thresholds)
 
-        ranked = sorted(per_id.items(), key=lambda x: x[1][0], reverse=True)
-        best_val = ranked[0][1][0]
-        corners: list = []
-        ids_list: list[int] = []
-        cap = int(self._ar.max_markers_per_frame)
-        for mid, (peak, px, py, tw, th) in ranked:
-            if peak < thr or best_val - peak > margin:
-                continue
-            c = np.array(
-                [[[px, py], [px + tw, py], [px + tw, py + th], [px, py + th]]],
-                dtype=np.float32,
-            )
-            corners.append(c)
-            ids_list.append(mid)
-            if len(ids_list) >= cap:
-                break
-        if not ids_list:
-            return [], np.empty((0, 1), dtype=np.int32)
-        return corners, np.array([[x] for x in ids_list], dtype=np.int32)
+        for scale in scales:
+            g = gray if scale == 1.0 else cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+            inv = 1.0 / scale
+            for variant in _gray_variants(g, self._tag):
+                for thresh in thresholds:
+                    info = _extract_black_tag_patch(variant, thresh, pad_frac)
+                    if info is None:
+                        continue
+                    patch, x0, y0, _bw, _bh, pad_px, _ = info
+                    up = cv2.resize(
+                        patch,
+                        (patch.shape[1] * upscale, patch.shape[0] * upscale),
+                        interpolation=cv2.INTER_CUBIC,
+                    )
+                    remap = (x0, y0, pad_px, upscale)
+                    corners, ids_list = self._collect_detections(up, margin_thr, remap=remap)
+                    if not ids_list:
+                        continue
+                    ids_arr = np.array([[x] for x in ids_list], dtype=np.int32)
+                    if scale != 1.0:
+                        corners = [np.array(c, dtype=np.float32) * inv for c in corners]
+                    if len(ids_list) > best_n:
+                        best_n = len(ids_list)
+                        best_c, best_ids = corners, ids_arr
+                        method = "apriltag_crop"
+                    if best_n >= 1:
+                        return best_c, best_ids, method
+
+        return best_c, best_ids, method
 
     def detect(self, frame_bgr: np.ndarray) -> FiducialDetection:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape[:2]
-        max_w = int(self._ar.max_detection_width)
+        max_w = int(self._tag.max_detection_width)
         scale_back = 1.0
         if max_w > 0 and w > max_w:
             scale_back = max_w / float(w)
             gray = cv2.resize(gray, (max_w, max(1, int(h * scale_back))), interpolation=cv2.INTER_AREA)
 
-        corners, ids = self._detect_aruco3(gray)
-        method = "aruco3" if len(ids) else "none"
-
-        if len(ids) == 0 and self._ar.use_template_fallback:
-            corners, ids = self._detect_template_ncc(gray)
-            method = "template" if len(ids) else "none"
+        corners, ids, method = self._detect_apriltag(gray)
 
         if scale_back != 1.0 and len(ids):
             inv = 1.0 / scale_back
@@ -251,4 +289,6 @@ class FiducialDetector:
 
         corners, ids = self._dedupe_by_id(corners, ids)
         corners, ids = self._validate_layout(corners, ids)
+        if len(ids) and method == "none":
+            method = "apriltag"
         return FiducialDetection(corners=corners, ids=ids, method=method)

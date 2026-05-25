@@ -1,6 +1,6 @@
 """
 Źródła obrazu dla trybu wizji: USB, zrzut monitora (mss), region wybranego okna (PyGetWindow + mss).
-Przydatne do testów ArUco z obrazem z przeglądarki (okno z kartą) zamiast z kamery USB.
+Przydatne do testów AprilTag z obrazem z przeglądarki (okno z kartą) zamiast z kamery USB.
 """
 from __future__ import annotations
 

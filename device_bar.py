@@ -70,7 +70,7 @@ class DeviceBarApp:
         self.preview_w_var = tk.IntVar(value=1400)
         ttk.Spinbox(row2, from_=0, to=3840, textvariable=self.preview_w_var, width=8).pack(side=tk.LEFT)
 
-        ttk.Label(row2, text="  Tryb: ArUco TOP+SIDE", style="Bar.TLabel").pack(side=tk.LEFT, padx=(16, 4))
+        ttk.Label(row2, text="  Tryb: AprilTag TOP+SIDE", style="Bar.TLabel").pack(side=tk.LEFT, padx=(16, 4))
 
         row3 = ttk.Frame(outer, style="Bar.TFrame")
         row3.pack(fill=tk.X, pady=8)

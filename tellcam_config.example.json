@@ -14,14 +14,14 @@
     "buffer_size": 1,
     "drain_frames_on_read": 2
   },
-  "aruco": {
-    "dictionary_name": "DICT_4X4_50",
+  "apriltag": {
+    "family": "tag36h11",
     "marker_ids": [0, 1, 2, 3, 4],
-    "marker_length_m": 0.02,
-    "use_aruco3_detection": true,
-    "use_template_fallback": true,
-    "template_match_threshold": 0.38,
-    "max_detection_width": 640,
+    "marker_length_m": 0.04,
+    "quad_decimate": 1.0,
+    "min_decision_margin": 5.0,
+    "use_black_crop_fallback": true,
+    "max_detection_width": 0,
     "max_markers_per_frame": 5,
     "intrinsics_from_frame_size": true
   },

@@ -1,5 +1,5 @@
 """
-Centralna konfiguracja Tellcam: kamery, pipeline, ArUco, PID, failsafe.
+Centralna konfiguracja Tellcam: kamery, pipeline, AprilTag, PID, failsafe.
 Nadpisania: plik JSON (tellcam_config.json) lub TELLCAM_CONFIG.
 """
 from __future__ import annotations
@@ -22,23 +22,26 @@ class CameraConfig:
 
 
 @dataclass
-class ArucoConfig:
-    dictionary_name: str = "DICT_4X4_50"
+class AprilTagConfig:
+    family: str = "tag36h11"
     marker_ids: Tuple[int, ...] = (0, 1, 2, 3, 4)
-    marker_length_m: float = 0.02
+    marker_length_m: float = 0.04  # bok czarnego kwadratu tagu [m], bez białej ramki
     layout_half_forward_m: float = 0.07
     layout_half_lateral_m: float = 0.07
     marker_side_height_m: float = 0.03
     calibration_path: str | None = None
     intrinsics_from_frame_size: bool = False
-    use_aruco3_detection: bool = True
     use_clahe: bool = True
-    min_marker_perimeter_rate: float = 0.01
-    use_template_fallback: bool = True
-    template_match_threshold: float = 0.38
-    template_match_margin: float = 0.05
-    template_match_scales: Tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
-    max_detection_width: int = 640
+    quad_decimate: float = 1.0
+    quad_sigma: float = 0.0
+    refine_edges: bool = True
+    decode_sharpening: float = 0.5
+    min_decision_margin: float = 5.0
+    use_black_crop_fallback: bool = True
+    black_crop_thresholds: Tuple[int, ...] = (50, 60, 70, 80, 90)
+    black_crop_pad_frac: float = 0.35
+    black_crop_upscale: int = 2
+    max_detection_width: int = 0
     max_markers_per_frame: int = 5
 
 
@@ -90,7 +93,7 @@ class PipelineConfig:
 class AppConfig:
     cameras: CameraConfig = field(default_factory=CameraConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
-    aruco: ArucoConfig = field(default_factory=ArucoConfig)
+    apriltag: AprilTagConfig = field(default_factory=AprilTagConfig)
     controller: ControllerConfig = field(default_factory=ControllerConfig)
     target: TargetConfig = field(default_factory=TargetConfig)
     failsafe: FailsafeConfig = field(default_factory=FailsafeConfig)
@@ -106,6 +109,24 @@ def _deep_update(obj, updates: dict) -> None:
             setattr(obj, k, v)
 
 
+def _migrate_legacy_aruco_section(data: dict) -> None:
+    """Stary klucz JSON „aruco” → „apriltag” (tag36h11, 40 mm)."""
+    if "apriltag" in data or "aruco" not in data:
+        return
+    legacy = dict(data.pop("aruco"))
+    legacy.pop("dictionary_name", None)
+    legacy.pop("use_aruco3_detection", None)
+    legacy.pop("use_template_fallback", None)
+    legacy.pop("template_match_threshold", None)
+    legacy.pop("template_match_margin", None)
+    legacy.pop("template_match_scales", None)
+    legacy.pop("min_marker_perimeter_rate", None)
+    if legacy.get("marker_length_m") == 0.02:
+        legacy["marker_length_m"] = 0.04
+    legacy.setdefault("family", "tag36h11")
+    data["apriltag"] = legacy
+
+
 def load_config(path: str | Path | None = None) -> AppConfig:
     cfg = AppConfig()
     env_path = os.environ.get("TELLCAM_CONFIG")
@@ -113,5 +134,6 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     if p.is_file():
         with open(p, encoding="utf-8") as f:
             data = json.load(f)
+        _migrate_legacy_aruco_section(data)
         _deep_update(cfg, data)
     return cfg

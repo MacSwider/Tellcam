@@ -1,4 +1,4 @@
-"""Fuzja TOP (pełna poza) i SIDE (korekta yaw/z) dla markerów ArUco."""
+"""Fuzja TOP (pełna poza) i SIDE (korekta yaw/z) dla tagów AprilTag."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from aruco_detector import SideCorrectionObservation, TopPoseObservation
+from apriltag_detector import SideCorrectionObservation, TopPoseObservation
 
 
 @dataclass

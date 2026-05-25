@@ -1,4 +1,4 @@
-"""Tellcam — nawigacja ArUco (TOP + SIDE) dla Ryze Tello."""
+"""Tellcam — nawigacja AprilTag tag36h11 (TOP + SIDE) dla Ryze Tello."""
 from __future__ import annotations
 
 import argparse
@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Tellcam — nawigacja ArUco TOP/SIDE + (opcjonalnie) Tello")
+    p = argparse.ArgumentParser(description="Tellcam — nawigacja AprilTag TOP/SIDE + (opcjonalnie) Tello")
     p.add_argument("--config", type=str, default=None, help="JSON z nadpisaniami configu")
     p.add_argument("--no-control", action="store_true", help="Wyłącz RC do drona (tylko detekcja / podgląd)")
     p.add_argument(
@@ -63,13 +63,13 @@ def _source_label(kind: str, args: argparse.Namespace) -> str:
     return f"{kind.upper()} | WINDOW {title[:28]}"
 
 
-def run_aruco_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
+def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
     if args.no_control:
         cfg.control_enabled = False
     if args.no_windows:
         cfg.debug_windows = False
-    if not cfg.aruco.calibration_path:
-        cfg.aruco.intrinsics_from_frame_size = True
+    if not cfg.apriltag.calibration_path:
+        cfg.apriltag.intrinsics_from_frame_size = True
 
     top_camera_index = args.top_camera_index if args.top_camera_index is not None else int(cfg.cameras.index_ceiling)
     side_camera_index = args.side_camera_index if args.side_camera_index is not None else int(cfg.cameras.index_side)
@@ -264,7 +264,11 @@ def main() -> int:
     if args.no_windows:
         cfg.debug_windows = False
 
-    return run_aruco_stack(cfg, args)
+    return run_vision_stack(cfg, args)
+
+
+# Alias wsteczny
+run_aruco_stack = run_vision_stack
 
 
 if __name__ == "__main__":
