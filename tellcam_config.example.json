@@ -9,30 +9,49 @@
   "cameras": {
     "index_ceiling": 0,
     "index_side": 1,
-    "width": 640,
-    "height": 480,
+    "width": 1280,
+    "height": 960,
     "buffer_size": 1,
-    "drain_frames_on_read": 2
+    "drain_frames_on_read": 2,
+    "fourcc": "MJPG"
   },
   "apriltag": {
     "family": "tag36h11",
     "marker_ids": [0, 1, 2, 3, 4],
     "marker_length_m": 0.04,
-    "quad_decimate": 1.0,
-    "min_decision_margin": 5.0,
-    "use_black_crop_fallback": true,
+    "quad_decimate": 2.0,
+    "min_decision_margin": 4.0,
+    "detection_upscales": [1.0],
+    "detection_lazy_upscale": true,
+    "use_black_crop_fallback": false,
+    "roi_tracking": true,
+    "roi_pad_frac": 0.6,
+    "roi_min_size_px": 160,
     "max_detection_width": 0,
     "max_markers_per_frame": 5,
     "intrinsics_from_frame_size": true
   },
   "controller": {
-    "pid_x": { "kp": 0.8, "ki": 0.02, "kd": 0.15 },
-    "pid_y": { "kp": 0.8, "ki": 0.02, "kd": 0.15 },
-    "pid_z": { "kp": 1.2, "ki": 0.05, "kd": 0.2 },
-    "pid_yaw": { "kp": 0.5, "ki": 0.01, "kd": 0.1 }
+    "pid_x": { "kp": 35.0, "ki": 0.0, "kd": 10.0, "output_limit": 20.0, "integral_limit": 8.0, "deadzone": 0.03, "slew_rate": 80.0 },
+    "pid_y": { "kp": 35.0, "ki": 0.0, "kd": 10.0, "output_limit": 20.0, "integral_limit": 8.0, "deadzone": 0.03, "slew_rate": 80.0 },
+    "pid_z": { "kp": 30.0, "ki": 0.0, "kd": 8.0, "output_limit": 18.0, "integral_limit": 8.0, "deadzone": 0.04, "slew_rate": 80.0 },
+    "pid_yaw": { "kp": 25.0, "ki": 0.0, "kd": 6.0, "output_limit": 15.0, "integral_limit": 8.0, "deadzone": 0.08, "slew_rate": 80.0 },
+    "max_rc_abs": 20,
+    "use_yaw": false
   },
-  "target": { "x_m": 0.0, "y_m": 0.0, "z_m": 1.0, "yaw_rad": 0.0 },
+  "target": { "x_m": 0.0, "y_m": 0.0, "z_m": 0.8, "yaw_rad": 0.0 },
+  "stabilization": {
+    "demo_side_only": false,
+    "control_frame": "top",
+    "enabled_axes": ["x", "y", "z"],
+    "use_yaw": false,
+    "top_reference_tag_id": 0,
+    "target_pose_m": { "x_m": 0.0, "y_m": 0.0, "z_m": 0.8, "yaw_rad": 0.0 }
+  },
+  "tracking": { "hold_last_pose_s": 0.6, "lost_timeout_s": 1.5, "pose_lowpass_alpha": 0.35 },
+  "safety": { "max_rc_abs": 20, "max_rc_slew_per_s": 80.0, "rc_send_hz": 15.0, "zero_rc_on_loss": true, "command_timeout_s": 1.0 },
+  "gui": { "show_pid_debug": true },
   "failsafe": { "max_lost_frames": 15, "on_lost_send_zero_rc": true },
   "debug_windows": true,
-  "control_enabled": false
+  "control_enabled": true
 }

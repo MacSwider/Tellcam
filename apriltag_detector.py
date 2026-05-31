@@ -38,6 +38,8 @@ class TopPoseObservation:
     yaw_rad: float = 0.0
     pitch_rad: float = 0.0
     roll_rad: float = 0.0
+    reference_marker_id: int | None = None
+    pose_quality: float = 0.0
     markers_seen: tuple[int, ...] = ()
     marker_overlays: Tuple[MarkerOverlay, ...] = ()
     hint: Optional[str] = None
@@ -46,11 +48,24 @@ class TopPoseObservation:
 @dataclass
 class SideCorrectionObservation:
     ok: bool
-    yaw_correction_rad: float = 0.0
-    z_from_marker_m: float = 0.0
+    x_m: float = 0.0
+    y_m: float = 0.0
+    z_m: float = 0.0
+    yaw_rad: float = 0.0
+    marker_id: int | None = None
+    image_area_px: float = 0.0
+    pose_quality: float = 0.0
     markers_seen: tuple[int, ...] = ()
     marker_overlays: Tuple[MarkerOverlay, ...] = ()
     hint: Optional[str] = None
+
+    @property
+    def yaw_correction_rad(self) -> float:
+        return self.yaw_rad
+
+    @property
+    def z_from_marker_m(self) -> float:
+        return self.z_m
 
 
 @dataclass
@@ -325,10 +340,12 @@ class AprilTagDetector:
 
         poses, all_seen, overlays = self._detect_markers(frame_bgr)
         seen = tuple(sorted({p.id for p in poses}))
+        reference_marker_id = 0 if 0 in seen else (seen[0] if seen else None)
 
         if not poses:
             return TopPoseObservation(
                 ok=False,
+                reference_marker_id=reference_marker_id,
                 marker_overlays=overlays,
                 hint=self._hint_no_detection(all_seen),
             )
@@ -365,6 +382,8 @@ class AprilTagDetector:
                 yaw_rad=_unwrap_yaw(yaw),
                 pitch_rad=pitch,
                 roll_rad=roll,
+                reference_marker_id=reference_marker_id,
+                pose_quality=min(1.0, len(seen) / 2.0),
                 markers_seen=seen,
                 marker_overlays=overlays,
                 hint=f"TOP: za mało tagów ({seen}). Potrzebny ID 0 lub ≥2 ID.",
@@ -378,8 +397,11 @@ class AprilTagDetector:
             yaw_rad=_unwrap_yaw(yaw),
             pitch_rad=pitch,
             roll_rad=roll,
+            reference_marker_id=reference_marker_id,
+            pose_quality=min(1.0, len(seen) / 3.0 + (0.25 if 0 in seen else 0.0)),
             markers_seen=seen,
             marker_overlays=overlays,
+            hint="TOP: śledzenie względem TAG 0" if 0 in seen else f"TOP: śledzenie layoutu bez TAG 0 ({seen})",
         )
 
     def detect_side_correction(self, frame_bgr: Optional[np.ndarray]) -> SideCorrectionObservation:
@@ -387,10 +409,9 @@ class AprilTagDetector:
             return SideCorrectionObservation(ok=False, hint="Brak klatki SIDE.")
 
         poses, all_seen, overlays = self._detect_markers(frame_bgr)
-        side_poses = [p for p in poses if p.id in SIDE_MARKER_IDS]
-        seen = tuple(sorted({p.id for p in side_poses}))
+        seen = tuple(sorted({p.id for p in poses}))
 
-        if not side_poses:
+        if not poses:
             return SideCorrectionObservation(
                 ok=False,
                 marker_overlays=overlays,
@@ -401,28 +422,24 @@ class AprilTagDetector:
             c = p.corners.reshape(-1, 2)
             return float(cv2.contourArea(c.astype(np.float32)))
 
-        best = max(side_poses, key=_area)
-        t_origin, R = self._origin_from_marker(best)
-        z_m = float(abs(t_origin[2]))
-        if z_m < 0.05:
-            z_m = float(abs(best.tvec[2]))
-
+        best = max(poses, key=_area)
+        image_area_px = _area(best)
+        frame_area = max(1.0, float(frame_bgr.shape[0] * frame_bgr.shape[1]))
+        pose_quality = float(np.clip(image_area_px / (0.2 * frame_area), 0.0, 1.0))
+        tvec = best.tvec.reshape(3)
+        R, _ = cv2.Rodrigues(best.rvec.reshape(3, 1))
         yaw_corr = float(np.arctan2(R[1, 0], R[0, 0]))
-        if len(side_poses) >= 2:
-            by_id = {p.id: p for p in side_poses}
-            if 1 in by_id and 2 in by_id:
-                c1 = by_id[1].corners.reshape(-1, 2).mean(axis=0)
-                c2 = by_id[2].corners.reshape(-1, 2).mean(axis=0)
-                yaw_corr = float(np.arctan2(c2[1] - c1[1], c2[0] - c1[0]))
-            elif 4 in by_id and 3 in by_id:
-                c4 = by_id[4].corners.reshape(-1, 2).mean(axis=0)
-                c3 = by_id[3].corners.reshape(-1, 2).mean(axis=0)
-                yaw_corr = float(np.arctan2(c3[1] - c4[1], c3[0] - c4[0]))
 
         return SideCorrectionObservation(
             ok=True,
-            yaw_correction_rad=_unwrap_yaw(yaw_corr),
-            z_from_marker_m=z_m,
+            x_m=float(tvec[0]),
+            y_m=float(-tvec[1]),
+            z_m=float(abs(tvec[2])),
+            yaw_rad=_unwrap_yaw(yaw_corr),
+            marker_id=best.id,
+            image_area_px=image_area_px,
+            pose_quality=pose_quality,
             markers_seen=seen,
             marker_overlays=overlays,
+            hint=f"SIDE tag={best.id} area={image_area_px:.0f}px quality={pose_quality:.2f}",
         )

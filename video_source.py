@@ -32,8 +32,8 @@ def list_window_titles(max_titles: int = 200) -> List[str]:
     return titles
 
 
-def probe_usb_camera_indices(max_index: int = 8) -> List[int]:
-    """Indeksy kamer USB, które da się otworzyć (szybki test OpenCV)."""
+def probe_usb_camera_indices(max_index: int = 12) -> List[int]:
+    """Indeksy kamer USB, które da się otworzyć i zwracają klatkę."""
     found: List[int] = []
     for i in range(max_index + 1):
         cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
@@ -41,7 +41,15 @@ def probe_usb_camera_indices(max_index: int = 8) -> List[int]:
             cap.release()
             cap = cv2.VideoCapture(i)
         if cap.isOpened():
-            found.append(i)
+            ok, _ = cap.read()
+            if not ok:
+                for _ in range(3):
+                    if cap.grab():
+                        ok, _ = cap.retrieve()
+                        if ok:
+                            break
+            if ok:
+                found.append(i)
         cap.release()
     return found
 
@@ -106,11 +114,27 @@ class UsbCeilingSource(VideoSource):
         self._cap = _open(self._index)
         if not self._cap.isOpened():
             raise RuntimeError(f"Nie otwarto kamery USB (index={self._index})")
+        fourcc = (self._cfg.fourcc or "").strip().upper()
+        if fourcc and len(fourcc) == 4:
+            self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._cfg.width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._cfg.height)
         buf = int(self._cfg.buffer_size)
         if buf > 0:
             self._cap.set(cv2.CAP_PROP_BUFFERSIZE, buf)
+        actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = float(self._cap.get(cv2.CAP_PROP_FPS))
+        log.info(
+            "USB cam index=%s requested=%sx%s actual=%sx%s fps=%.1f fourcc=%s",
+            self._index,
+            self._cfg.width,
+            self._cfg.height,
+            actual_w,
+            actual_h,
+            actual_fps,
+            fourcc or "auto",
+        )
 
     def read_bgr(self) -> Tuple[bool, Optional[np.ndarray]]:
         if not self._cap:

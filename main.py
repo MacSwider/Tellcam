@@ -11,7 +11,8 @@ import cv2
 from config import AppConfig, load_config
 from controller import DroneController
 from state_estimator import DroneState
-from tello_interface import TelloConfig, TelloInterface
+from tello_interface import TelloConfig, TelloController
+from trajectory_planner import FutureTrajectoryPlanner, TrajectoryPoint
 from video_source import create_video_source
 from vision_pipeline import PipelineConfig, build_vision_pipeline
 
@@ -70,6 +71,8 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
         cfg.debug_windows = False
     if not cfg.apriltag.calibration_path:
         cfg.apriltag.intrinsics_from_frame_size = True
+    cfg.controller.use_yaw = bool(cfg.stabilization.use_yaw)
+    reference_tag_id = int(cfg.stabilization.top_reference_tag_id)
 
     top_camera_index = args.top_camera_index if args.top_camera_index is not None else int(cfg.cameras.index_ceiling)
     side_camera_index = args.side_camera_index if args.side_camera_index is not None else int(cfg.cameras.index_side)
@@ -83,6 +86,8 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
             window_title=args.top_window_title,
             window_match_index=args.top_window_match_index,
         )
+
+    top_factory_ref = None if cfg.stabilization.demo_side_only else top_factory
 
     def side_factory():
         return create_video_source(
@@ -101,11 +106,22 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
         preview_hz=cfg.pipeline.preview_hz,
     )
 
-    controller = DroneController(cfg.controller, cfg.target)
-    tello = TelloInterface(TelloConfig(mock=args.mock_tello))
-    lost_frames = 0
-    failsafe_active = False
-    flight_active = False
+    static_target = cfg.stabilization.target_pose_m
+    planner = FutureTrajectoryPlanner(
+        TrajectoryPoint(
+            x_m=static_target.x_m,
+            y_m=static_target.y_m,
+            z_m=static_target.z_m,
+            yaw_rad=static_target.yaw_rad,
+        )
+    )
+    controller = DroneController(cfg.controller, static_target, cfg.stabilization, cfg.safety)
+    tello = TelloController(
+        TelloConfig(
+            mock=args.mock_tello,
+            rc_send_hz=cfg.safety.rc_send_hz,
+        )
+    )
 
     def _ensure_tello() -> bool:
         if tello.connected:
@@ -123,82 +139,126 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
             log.warning("Brak Tello przy starcie — START spróbuje ponownie.")
 
     def on_control_tick(state: DroneState, top_obs, side_obs, dt: float) -> list[str]:
-        nonlocal lost_frames, failsafe_active, flight_active
-
-        status_lines = [
-            f"valid={state.valid} top={top_obs.ok} side={side_obs.ok}",
-            f"top_ids={list(top_obs.markers_seen)} side_ids={list(side_obs.markers_seen)}",
-            f"x={state.x_m:.2f} y={state.y_m:.2f} z={state.z_m:.2f}",
-            f"yaw={state.yaw_rad:.2f} pitch={state.pitch_rad:.2f} roll={state.roll_rad:.2f}",
-            f"failsafe={failsafe_active} lost={lost_frames}",
-            f"control={cfg.control_enabled} tello={'OK' if tello.connected else '—'}",
-        ]
-        if top_obs.hint:
-            status_lines.append(f"top_hint={top_obs.hint}")
-        if side_obs.hint:
-            status_lines.append(f"side_hint={side_obs.hint}")
-        if cfg.control_enabled:
-            status_lines.append(f"flight={'ON' if flight_active else 'OFF'} (START/LAND)")
-        else:
-            status_lines.append("tryb detekcji (bez sterowania dronem)")
+        telemetry = tello.get_snapshot()
+        planner_target = planner.peek_target()
+        top_ref_seen = reference_tag_id in top_obs.markers_seen
+        controller.set_target(
+            type(static_target)(
+                x_m=planner_target.x_m,
+                y_m=planner_target.y_m,
+                z_m=planner_target.z_m,
+                yaw_rad=planner_target.yaw_rad,
+            )
+        )
 
         pipeline = on_control_tick._pipeline  # type: ignore[attr-defined]
         shared = pipeline.shared
         while True:
             try:
-                cx, cy = shared.mouse_clicks.get_nowait()
+                action = shared.ui_events.get_nowait()
             except queue.Empty:
                 break
-            x0, y0, x1, y1 = shared.get_button_rect()
-            if x0 <= cx <= x1 and y0 <= cy <= y1:
-                if not cfg.control_enabled:
-                    log.info("START/LAND wyłączone (tryb detekcji)")
-                elif not _ensure_tello():
-                    log.error("START/LAND: brak połączenia z Tello")
-                elif not flight_active:
+            if not cfg.control_enabled and action != "connect":
+                log.info("Sterowanie wyłączone — klik %s pominięty", action)
+                continue
+            if action == "connect":
+                if _ensure_tello():
+                    log.info("GUI: połączono z Tello")
+            elif action == "takeoff":
+                if _ensure_tello() and not tello.flying:
                     tello.takeoff()
-                    flight_active = True
                     controller.reset()
-                    log.info("START — takeoff")
-                else:
-                    tello.send_rc_zero()
+                    log.info("GUI: takeoff")
+            elif action == "land":
+                if tello.connected and tello.flying:
+                    tello.send_rc_zero(force=True, hover_reason="land")
                     tello.land()
-                    flight_active = False
                     controller.reset()
-                    log.info("LAND — lądowanie")
+                    log.info("GUI: land")
+            elif action == "emergency":
+                if tello.connected:
+                    tello.emergency_stop()
+                    controller.reset()
+                    log.warning("GUI: emergency stop")
 
-        if state.valid:
-            lost_frames = 0
-            if failsafe_active:
-                failsafe_active = False
+        if state.valid and telemetry.flying and cfg.control_enabled and tello.connected:
+            cmd = controller.compute(
+                state.x_m,
+                state.y_m,
+                state.z_m,
+                state.yaw_rad,
+                dt,
+                freeze_integrators=(state.tracking_state != "TRACKING"),
+            )
+            tello.send_rc(cmd)
+        elif telemetry.flying and cfg.control_enabled and tello.connected and cfg.safety.zero_rc_on_loss:
+            tello.send_rc_zero(hover_reason=f"tracking_{state.tracking_state.lower()}")
+            if state.tracking_state in {"LOST", "TIMED_OUT"}:
                 controller.reset()
-                log.info("Detekcja przywrócona — wznowienie PID")
-            if flight_active and cfg.control_enabled and tello.connected:
-                cmd = controller.compute(state.x_m, state.y_m, state.z_m, state.yaw_rad, dt)
-                tello.send_rc(cmd)
-                status_lines.append(f"RC r={cmd.roll} p={cmd.pitch} thr={cmd.throttle} y={cmd.yaw}")
-        else:
-            lost_frames += 1
-            if not failsafe_active:
-                log.warning("Utrata pełnej detekcji — RC=0")
-                failsafe_active = True
-            controller.reset()
-            if (
-                flight_active
-                and cfg.failsafe.on_lost_send_zero_rc
-                and cfg.control_enabled
-                and tello.connected
-            ):
-                tello.send_rc_zero()
-            if lost_frames >= cfg.failsafe.max_lost_frames and lost_frames % 30 == 0:
-                log.warning("Brak detekcji przez %s klatek", lost_frames)
+
+        telemetry = tello.get_snapshot()
+        status_lines = [
+            (
+                f"tracking={state.tracking_state} valid={state.valid} "
+                f"ref_tag={reference_tag_id} top_ref={'YES' if top_ref_seen else 'NO'}"
+            ),
+            (
+                f"pose x={state.x_m:+.2f}m y={state.y_m:+.2f}m "
+                f"z={state.z_m:.2f}m yaw={state.yaw_rad:+.2f}rad age={state.pose_age_s:.2f}s"
+            ),
+            (
+                f"target x={planner_target.x_m:+.2f}m y={planner_target.y_m:+.2f}m "
+                f"z={planner_target.z_m:.2f}m yaw={planner_target.yaw_rad:+.2f}rad"
+            ),
+            (
+                f"tello={'OK' if telemetry.connected else 'OFF'} flight={'ON' if telemetry.flying else 'OFF'} "
+                f"battery={telemetry.battery if telemetry.battery is not None else '--'}%"
+            ),
+            (
+                f"rc lr={telemetry.current_rc.left_right:+d} fb={telemetry.current_rc.forward_back:+d} "
+                f"ud={telemetry.current_rc.up_down:+d} yaw={telemetry.current_rc.yaw:+d}"
+            ),
+            (
+                f"top_tag_ids={list(top_obs.markers_seen)} q={top_obs.pose_quality:.2f} "
+                f"side_tag_ids={list(side_obs.markers_seen)} q={side_obs.pose_quality:.2f}"
+            ),
+            f"control={cfg.control_enabled} frame={cfg.stabilization.control_frame} side_only={cfg.stabilization.demo_side_only}",
+        ]
+
+        debug = controller.last_debug
+        if cfg.gui.show_pid_debug:
+            if cfg.stabilization.control_frame.strip().lower() == "top":
+                pid_line = (
+                    f"pid lr={debug.lateral.output:+.1f}({debug.lateral.error:+.2f}) "
+                    f"fb={debug.vertical.output:+.1f}({debug.vertical.error:+.2f}) "
+                    f"ud={debug.distance.output:+.1f}({debug.distance.error:+.2f}) "
+                    f"yaw={debug.yaw.output:+.1f}({debug.yaw.error:+.2f})"
+                )
+            else:
+                pid_line = (
+                    f"pid lr={debug.lateral.output:+.1f}({debug.lateral.error:+.2f}) "
+                    f"ud={debug.vertical.output:+.1f}({debug.vertical.error:+.2f}) "
+                    f"fb={debug.distance.output:+.1f}({debug.distance.error:+.2f}) "
+                    f"yaw={debug.yaw.output:+.1f}({debug.yaw.error:+.2f})"
+                )
+            status_lines.append(
+                pid_line
+            )
+        if state.hint:
+            status_lines.append(f"tracking_hint={state.hint}")
+        if top_obs.hint and not cfg.stabilization.demo_side_only:
+            status_lines.append(f"top_hint={top_obs.hint}")
+        if side_obs.hint:
+            status_lines.append(f"side_hint={side_obs.hint}")
 
         _, _, top_ts, side_ts = shared.read_poses()
         now = time.perf_counter()
+        top_pose_age = now - top_ts if top_ts else 0.0
+        side_pose_age = now - side_ts if side_ts else 0.0
         status_lines.append(
-            f"pose_age top={now - top_ts:.2f}s side={now - side_ts:.2f}s "
-            f"det top={pipeline.top_detection.detection_hz:.1f}Hz "
-            f"side={pipeline.side_detection.detection_hz:.1f}Hz"
+            f"pose_age top={top_pose_age:.2f}s side={side_pose_age:.2f}s "
+            f"det top={pipeline.top_detection.detection_hz if pipeline.top_detection else 0.0:.1f}Hz "
+            f"side={pipeline.side_detection.detection_hz if pipeline.side_detection else 0.0:.1f}Hz"
         )
         if pipeline.top_camera:
             status_lines.append(f"cam_top={pipeline.top_camera.read_hz:.1f}Hz")
@@ -210,11 +270,11 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
         pipeline = build_vision_pipeline(
             cfg,
             pipeline_cfg,
-            top_factory,
+            top_factory_ref,
             side_factory,
             on_control_tick,
             preview_enabled=cfg.debug_windows,
-            top_label=_source_label("top", args),
+            top_label="TOP | disabled" if cfg.stabilization.demo_side_only else _source_label("top", args),
             side_label=_source_label("side", args),
             preview_max_width=args.preview_max_width,
         )
@@ -226,10 +286,11 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
 
     if cfg.control_enabled:
         log.info(
-            "Pipeline: control=%.0f Hz det_top=%.0f Hz det_side=%.0f Hz | Q kończy",
+            "Pipeline: control=%.0f Hz det_top=%.0f Hz det_side=%.0f Hz | demo_side_only=%s | Q kończy",
             pipeline_cfg.control_hz,
             pipeline_cfg.detection_hz_top,
             pipeline_cfg.detection_hz_side,
+            cfg.stabilization.demo_side_only,
         )
     else:
         log.info("Pipeline detekcji — Q kończy | bez Tello")
@@ -240,8 +301,8 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
         log.info("Przerwano przez użytkownika")
     finally:
         if tello.connected:
-            tello.send_rc_zero()
-            if flight_active:
+            tello.send_rc_zero(force=True, hover_reason="shutdown")
+            if tello.flying:
                 try:
                     tello.land()
                 except Exception:

@@ -114,12 +114,15 @@ class FiducialDetector:
         self._allowed_set = set(self._allowed)
         self._detector = Detector(
             families=tag_cfg.family,
-            nthreads=1,
+            nthreads=2,
             quad_decimate=float(tag_cfg.quad_decimate),
             quad_sigma=float(tag_cfg.quad_sigma),
             refine_edges=1 if tag_cfg.refine_edges else 0,
             decode_sharpening=float(tag_cfg.decode_sharpening),
         )
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if tag_cfg.use_clahe else None
+        # Stan śledzenia ROI (wycinek wokół ostatniej detekcji).
+        self._last_roi: tuple[int, int, int, int] | None = None
 
     def _filter_allowed(
         self, corners: list | None, ids: np.ndarray | None
@@ -166,9 +169,9 @@ class FiducialDetector:
         keep_c: list = []
         for i, mid in enumerate(ids.flatten()):
             mid = int(mid)
-            if med_area > 0 and areas[mid] < med_area * 0.15:
+            if med_area > 0 and areas[mid] < med_area * 0.08:
                 continue
-            if med_area > 0 and areas[mid] > med_area * 8.0:
+            if med_area > 0 and areas[mid] > med_area * 10.0:
                 continue
             keep_ids.append(mid)
             keep_c.append(corners[i])
@@ -200,77 +203,50 @@ class FiducialDetector:
             ids_list.append(mid)
         return corners, ids_list
 
+    def _single_pass(self, gray: np.ndarray, margin_thr: float) -> tuple[list, list[int]]:
+        """Jeden przebieg: raw, a jeśli pusto i CLAHE włączone — wariant CLAHE."""
+        corners, ids_list = self._collect_detections(gray, margin_thr)
+        if not ids_list and self._clahe is not None:
+            corners, ids_list = self._collect_detections(self._clahe.apply(gray), margin_thr)
+        return corners, ids_list
+
     def _detect_apriltag(self, gray: np.ndarray) -> tuple[list, np.ndarray, str]:
-        best_c: list = []
-        best_ids = np.empty((0, 1), dtype=np.int32)
-        best_n = 0
-        method = "none"
+        """Lekka ścieżka: raw → CLAHE → opcjonalnie jeden upscale (tylko gdy skonfigurowany)."""
         h, w = gray.shape[:2]
-        scales = [1.0]
-        if min(h, w) < 280:
-            scales.append(2.0)
         margin_thr = float(self._tag.min_decision_margin)
 
-        for scale in scales:
-            g = gray if scale == 1.0 else cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-            inv = 1.0 / scale
-            for variant in _gray_variants(g, self._tag):
-                corners, ids_list = self._collect_detections(variant, margin_thr)
-                if not ids_list:
-                    continue
-                ids_arr = np.array([[x] for x in ids_list], dtype=np.int32)
-                if len(ids_list) > best_n:
-                    best_n = len(ids_list)
-                    if scale != 1.0:
-                        scaled_c = [np.array(c, dtype=np.float32) * inv for c in corners]
-                        best_c, best_ids = scaled_c, ids_arr
-                    else:
-                        best_c, best_ids = corners, ids_arr
-                    method = "apriltag"
-                if best_n >= 2:
-                    return best_c, best_ids, method
-            if best_n >= 2:
-                return best_c, best_ids, method
+        corners, ids_list = self._single_pass(gray, margin_thr)
+        if ids_list:
+            return corners, np.array([[x] for x in ids_list], dtype=np.int32), "apriltag"
 
-        if best_n > 0:
-            return best_c, best_ids, method
+        # Opcjonalny pojedynczy upscale dla małych/dalekich tagów (domyślnie wyłączony).
+        for scale in (s for s in self._tag.detection_upscales if float(s) > 1.0):
+            inv = 1.0 / float(scale)
+            g = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+            corners, ids_list = self._single_pass(g, margin_thr)
+            if ids_list:
+                corners = [np.asarray(c, dtype=np.float32) * inv for c in corners]
+                return corners, np.array([[x] for x in ids_list], dtype=np.int32), "apriltag"
+            break  # tylko jedna próba upscalingu w gorącej pętli
 
-        if not self._tag.use_black_crop_fallback:
-            return best_c, best_ids, method
+        return [], np.empty((0, 1), dtype=np.int32), "none"
 
-        pad_frac = float(self._tag.black_crop_pad_frac)
-        upscale = max(1, int(self._tag.black_crop_upscale))
-        thresholds = tuple(int(t) for t in self._tag.black_crop_thresholds)
-
-        for scale in scales:
-            g = gray if scale == 1.0 else cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-            inv = 1.0 / scale
-            for variant in _gray_variants(g, self._tag):
-                for thresh in thresholds:
-                    info = _extract_black_tag_patch(variant, thresh, pad_frac)
-                    if info is None:
-                        continue
-                    patch, x0, y0, _bw, _bh, pad_px, _ = info
-                    up = cv2.resize(
-                        patch,
-                        (patch.shape[1] * upscale, patch.shape[0] * upscale),
-                        interpolation=cv2.INTER_CUBIC,
-                    )
-                    remap = (x0, y0, pad_px, upscale)
-                    corners, ids_list = self._collect_detections(up, margin_thr, remap=remap)
-                    if not ids_list:
-                        continue
-                    ids_arr = np.array([[x] for x in ids_list], dtype=np.int32)
-                    if scale != 1.0:
-                        corners = [np.array(c, dtype=np.float32) * inv for c in corners]
-                    if len(ids_list) > best_n:
-                        best_n = len(ids_list)
-                        best_c, best_ids = corners, ids_arr
-                        method = "apriltag_crop"
-                    if best_n >= 1:
-                        return best_c, best_ids, method
-
-        return best_c, best_ids, method
+    def _roi_from_corners(self, corners: list, w: int, h: int) -> tuple[int, int, int, int] | None:
+        if not corners:
+            return None
+        pts = np.concatenate([np.asarray(c, dtype=np.float32).reshape(-1, 2) for c in corners], axis=0)
+        x0, y0 = pts[:, 0].min(), pts[:, 1].min()
+        x1, y1 = pts[:, 0].max(), pts[:, 1].max()
+        bw, bh = x1 - x0, y1 - y0
+        pad_frac = float(self._tag.roi_pad_frac)
+        pad = max(float(self._tag.roi_min_size_px) * 0.5, max(bw, bh) * pad_frac)
+        rx0 = max(0, int(x0 - pad))
+        ry0 = max(0, int(y0 - pad))
+        rx1 = min(w, int(x1 + pad))
+        ry1 = min(h, int(y1 + pad))
+        if rx1 - rx0 < 16 or ry1 - ry0 < 16:
+            return None
+        return rx0, ry0, rx1, ry1
 
     def detect(self, frame_bgr: np.ndarray) -> FiducialDetection:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -280,15 +256,44 @@ class FiducialDetector:
         if max_w > 0 and w > max_w:
             scale_back = max_w / float(w)
             gray = cv2.resize(gray, (max_w, max(1, int(h * scale_back))), interpolation=cv2.INTER_AREA)
+        gh, gw = gray.shape[:2]
 
-        corners, ids, method = self._detect_apriltag(gray)
+        corners: list = []
+        ids = np.empty((0, 1), dtype=np.int32)
+        method = "none"
+
+        # Szybka ścieżka: szukaj najpierw w ROI wokół ostatniej detekcji.
+        if self._tag.roi_tracking and self._last_roi is not None:
+            rx0, ry0, rx1, ry1 = self._last_roi
+            rx0, ry0 = max(0, min(rx0, gw - 1)), max(0, min(ry0, gh - 1))
+            rx1, ry1 = max(rx0 + 1, min(rx1, gw)), max(ry0 + 1, min(ry1, gh))
+            sub = gray[ry0:ry1, rx0:rx1]
+            c_roi, ids_roi, m_roi = self._detect_apriltag(sub)
+            if len(ids_roi):
+                corners = [np.asarray(c, dtype=np.float32).reshape(1, 4, 2) + np.array([rx0, ry0], dtype=np.float32) for c in c_roi]
+                ids, method = ids_roi, m_roi
+
+        # Pełna klatka, jeśli ROI nic nie dało (lub wyłączone).
+        if not len(ids):
+            corners, ids, method = self._detect_apriltag(gray)
 
         if scale_back != 1.0 and len(ids):
             inv = 1.0 / scale_back
-            corners = [np.array(c, dtype=np.float32) * inv for c in corners]
+            corners = [np.asarray(c, dtype=np.float32) * inv for c in corners]
 
         corners, ids = self._dedupe_by_id(corners, ids)
         corners, ids = self._validate_layout(corners, ids)
         if len(ids) and method == "none":
             method = "apriltag"
+
+        # Aktualizuj ROI na podstawie detekcji w przestrzeni gray (przed scale_back).
+        if self._tag.roi_tracking:
+            if len(ids):
+                src = corners
+                if scale_back != 1.0:
+                    src = [np.asarray(c, dtype=np.float32) * scale_back for c in corners]
+                self._last_roi = self._roi_from_corners(src, gw, gh)
+            else:
+                self._last_roi = None
+
         return FiducialDetection(corners=corners, ids=ids, method=method)

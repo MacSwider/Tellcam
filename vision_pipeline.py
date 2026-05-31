@@ -91,6 +91,7 @@ class VisionSharedState:
         self.status = StatusSnapshot()
         self.stop = threading.Event()
         self.mouse_clicks: queue.Queue[Tuple[int, int]] = queue.Queue(maxsize=8)
+        self.ui_events: queue.Queue[str] = queue.Queue(maxsize=16)
         self.button_rect: Tuple[int, int, int, int] = (0, 0, 0, 0)
         self._button_lock = threading.Lock()
 
@@ -243,6 +244,8 @@ class AprilTagDetectionWorker(threading.Thread):
         self._detector = AprilTagDetector(apriltag_cfg, camera_cfg)
         self.detection_count = 0
         self.detection_hz = 0.0
+        self.last_detect_ms = 0.0
+        self._slow_warn_t = 0.0
 
     def _detect(self, frame: np.ndarray) -> Union[TopPoseObservation, SideCorrectionObservation]:
         if self._mode == TOP:
@@ -270,6 +273,18 @@ class AprilTagDetectionWorker(threading.Thread):
                     self.detection_count += 1
                     fps_n += 1
                 elapsed = time.perf_counter() - t0
+                self.last_detect_ms = elapsed * 1000.0
+                if elapsed > self._period * 1.5 and (time.perf_counter() - self._slow_warn_t) > 5.0:
+                    self._slow_warn_t = time.perf_counter()
+                    log.warning(
+                        "[%s] detekcja wolna: %.0f ms (limit ~%.0f ms @ %.1f Hz, frame=%sx%s)",
+                        self.name,
+                        self.last_detect_ms,
+                        self._period * 1000.0,
+                        1.0 / self._period,
+                        frame.shape[1] if frame is not None else 0,
+                        frame.shape[0] if frame is not None else 0,
+                    )
                 sleep_s = self._period - elapsed
                 if sleep_s > 0:
                     if self._shared.stop.wait(timeout=sleep_s):
@@ -321,10 +336,9 @@ class ControlLoop:
             dt = tick_start - last_t
             last_t = tick_start
 
-            top_obs, side_obs, top_ts, side_ts = self._shared.read_poses()
-            state = self._estimator.update(top_obs, side_obs)
-
             now = time.perf_counter()
+            top_obs, side_obs, top_ts, side_ts = self._shared.read_poses()
+            state = self._estimator.update(top_obs, side_obs, top_ts=top_ts, side_ts=side_ts, now=now)
             lines: List[str] = []
             if self._on_tick:
                 lines = self._on_tick(state, top_obs, side_obs, dt)
@@ -405,6 +419,8 @@ class PreviewGUI(threading.Thread):
         side_label: str = "SIDE",
         preview_max_width: int = 1400,
         control_enabled: bool = False,
+        top_enabled: bool = True,
+        side_enabled: bool = True,
         on_mouse_setup: bool = True,
         daemon: bool = True,
     ) -> None:
@@ -417,16 +433,28 @@ class PreviewGUI(threading.Thread):
         self._side_label = side_label
         self._preview_max_width = preview_max_width
         self._control_enabled = control_enabled
+        self._top_enabled = top_enabled
+        self._side_enabled = side_enabled
         self.button_rect: Tuple[int, int, int, int] = (0, 0, 0, 0)
+        self.button_rects: dict[str, Tuple[int, int, int, int]] = {}
         self.preview_hz = 0.0
 
     def _on_mouse(self, event, x, y, flags, param) -> None:
         del flags, param
         if event == cv2.EVENT_LBUTTONDOWN:
-            try:
-                self._shared.mouse_clicks.put_nowait((int(x), int(y)))
-            except queue.Full:
-                pass
+            for action, (x0, y0, x1, y1) in self.button_rects.items():
+                if x0 <= x <= x1 and y0 <= y <= y1:
+                    try:
+                        self._shared.ui_events.put_nowait(action)
+                    except queue.Full:
+                        pass
+                    break
+
+    @staticmethod
+    def _placeholder_frame(label: str, width: int = 640, height: int = 480) -> np.ndarray:
+        frame = np.full((height, width, 3), (24, 24, 24), dtype=np.uint8)
+        cv2.putText(frame, label, (30, height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (180, 180, 180), 2, cv2.LINE_AA)
+        return frame
 
     @staticmethod
     def _add_source_bar(frame: np.ndarray, label: str) -> np.ndarray:
@@ -440,7 +468,7 @@ class PreviewGUI(threading.Thread):
             return live
         overlays, overlay_ts = self._shared.peek_marker_overlay(camera_id)
         age = time.perf_counter() - overlay_ts if overlay_ts else 999.0
-        return draw_marker_overlays(live, overlays, overlay_age_s=age)
+        return draw_marker_overlays(live, overlays, max_age_s=1.5, overlay_age_s=age)
 
     @staticmethod
     def _draw_overlay(img, text_lines: List[str], color: Tuple[int, int, int] = (0, 220, 220)) -> None:
@@ -462,10 +490,10 @@ class PreviewGUI(threading.Thread):
                 side_frame, _ = self._shared.peek_frame(SIDE)
                 status = self._shared.read_status()
 
-                if top_frame is None or side_frame is None:
-                    if self._shared.stop.wait(timeout=0.01):
-                        break
-                    continue
+                if top_frame is None:
+                    top_frame = self._placeholder_frame("TOP disabled" if not self._top_enabled else "TOP waiting...")
+                if side_frame is None:
+                    side_frame = self._placeholder_frame("SIDE disabled" if not self._side_enabled else "SIDE waiting...")
 
                 top_disp = self._frame_for_preview(TOP, top_frame)
                 side_disp = self._frame_for_preview(SIDE, side_frame)
@@ -483,35 +511,45 @@ class PreviewGUI(threading.Thread):
                         f"frame_age top={status.top_frame_age_s:.2f}s side={status.side_frame_age_s:.2f}s"
                     ),
                 ]
-                term_h = 120
-                terminal = np.zeros((term_h, cameras_panel.shape[1], 3), dtype=np.uint8)
                 all_lines = header + status.lines
+                term_h = max(220, 26 * (len(all_lines) + 3))
+                terminal = np.zeros((term_h, cameras_panel.shape[1], 3), dtype=np.uint8)
                 self._draw_overlay(terminal, all_lines)
 
-                btn_w, btn_h = 180, 42
-                bx0 = max(10, terminal.shape[1] - btn_w - 12)
-                by0 = max(8, term_h - btn_h - 10)
-                bx1, by1 = bx0 + btn_w, by0 + btn_h
-                rect = (bx0, cameras_panel.shape[0] + by0, bx1, cameras_panel.shape[0] + by1)
-                self.button_rect = rect
-                self._shared.set_button_rect(rect)
-
                 if self._control_enabled:
-                    flight_on = any("flight=ON" in ln for ln in status.lines)
-                    btn_color = (0, 180, 0) if not flight_on else (0, 80, 220)
-                    cv2.rectangle(terminal, (bx0, by0), (bx1, by1), btn_color, -1)
-                    cv2.rectangle(terminal, (bx0, by0), (bx1, by1), (255, 255, 255), 1)
-                    label = "START" if not flight_on else "LAND"
-                    cv2.putText(
-                        terminal,
-                        label,
-                        (bx0 + 50, by0 + 28),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
+                    button_specs = [
+                        ("connect", "Connect", (70, 70, 180)),
+                        ("takeoff", "Takeoff", (0, 140, 0)),
+                        ("land", "Land", (0, 120, 200)),
+                        ("emergency", "EMERGENCY", (0, 0, 220)),
+                    ]
+                    btn_w, btn_h, gap = 150, 40, 12
+                    by0 = max(8, term_h - btn_h - 10)
+                    total_w = len(button_specs) * btn_w + (len(button_specs) - 1) * gap
+                    bx = max(10, terminal.shape[1] - total_w - 10)
+                    self.button_rects = {}
+                    for action, label, color in button_specs:
+                        x0, y0 = bx, by0
+                        x1, y1 = x0 + btn_w, y0 + btn_h
+                        cv2.rectangle(terminal, (x0, y0), (x1, y1), color, -1)
+                        cv2.rectangle(terminal, (x0, y0), (x1, y1), (255, 255, 255), 1)
+                        cv2.putText(
+                            terminal,
+                            label,
+                            (x0 + 12, y0 + 26),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                        self.button_rects[action] = (
+                            x0,
+                            cameras_panel.shape[0] + y0,
+                            x1,
+                            cameras_panel.shape[0] + y1,
+                        )
+                        bx += btn_w + gap
 
                 panel = cv2.vconcat([cameras_panel, terminal])
                 disp = panel
@@ -549,25 +587,25 @@ class VisionPipeline:
     """Uruchamia wątki i blokuje na ControlLoop w wątku głównym."""
 
     shared: VisionSharedState
-    top_camera: CameraReader
-    side_camera: CameraReader
-    top_detection: AprilTagDetectionWorker
-    side_detection: AprilTagDetectionWorker
+    top_camera: Optional[CameraReader]
+    side_camera: Optional[CameraReader]
+    top_detection: Optional[AprilTagDetectionWorker]
+    side_detection: Optional[AprilTagDetectionWorker]
     control: ControlLoop
     preview: Optional[PreviewGUI] = None
 
     def start_workers(self) -> None:
-        self.top_camera.start()
-        self.side_camera.start()
-        self.top_detection.start()
-        self.side_detection.start()
+        for worker in (self.top_camera, self.side_camera, self.top_detection, self.side_detection):
+            if worker:
+                worker.start()
         if self.preview:
             self.preview.start()
 
     def stop(self) -> None:
         self.shared.stop.set()
         for t in (self.top_camera, self.side_camera, self.top_detection, self.side_detection):
-            t.join(timeout=3.0)
+            if t:
+                t.join(timeout=3.0)
         if self.preview and self.preview.is_alive():
             self.preview.join(timeout=3.0)
         cv2.destroyAllWindows()
@@ -583,7 +621,7 @@ class VisionPipeline:
 def build_vision_pipeline(
     cfg: AppConfig,
     pipeline_cfg: PipelineConfig,
-    top_source_factory: Callable[[], VideoSource],
+    top_source_factory: Optional[Callable[[], VideoSource]],
     side_source_factory: Callable[[], VideoSource],
     on_control_tick: Callable[[DroneState, TopPoseObservation, SideCorrectionObservation, float], List[str]],
     *,
@@ -593,17 +631,20 @@ def build_vision_pipeline(
     preview_max_width: int = 1400,
 ) -> VisionPipeline:
     shared = VisionSharedState()
-    top_camera = CameraReader("TopCamera", TOP, top_source_factory, shared)
+    top_camera: Optional[CameraReader] = None
+    top_detection: Optional[AprilTagDetectionWorker] = None
+    if top_source_factory is not None:
+        top_camera = CameraReader("TopCamera", TOP, top_source_factory, shared)
+        top_detection = AprilTagDetectionWorker(
+            "TopAprilTag",
+            TOP,
+            pipeline_cfg.detection_hz_top,
+            shared,
+            cfg.apriltag,
+            cfg.cameras,
+            mode=TOP,
+        )
     side_camera = CameraReader("SideCamera", SIDE, side_source_factory, shared)
-    top_detection = AprilTagDetectionWorker(
-        "TopAprilTag",
-        TOP,
-        pipeline_cfg.detection_hz_top,
-        shared,
-        cfg.apriltag,
-        cfg.cameras,
-        mode=TOP,
-    )
     side_detection = AprilTagDetectionWorker(
         "SideAprilTag",
         SIDE,
@@ -616,7 +657,7 @@ def build_vision_pipeline(
     control = ControlLoop(
         shared,
         pipeline_cfg,
-        StateEstimator(),
+        StateEstimator(cfg.tracking),
         on_tick=on_control_tick,
         top_detection=top_detection,
         side_detection=side_detection,
@@ -632,6 +673,8 @@ def build_vision_pipeline(
             side_label=side_label,
             preview_max_width=preview_max_width,
             control_enabled=cfg.control_enabled,
+            top_enabled=top_camera is not None,
+            side_enabled=side_camera is not None,
         )
     return VisionPipeline(
         shared=shared,
