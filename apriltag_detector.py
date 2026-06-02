@@ -52,6 +52,9 @@ class SideCorrectionObservation:
     y_m: float = 0.0
     z_m: float = 0.0
     yaw_rad: float = 0.0
+    # Kąt „zwrócenia” tagu do kamery bocznej: 0 = marker patrzy wprost na kamerę.
+    # Rośnie, gdy dron obraca się w yaw i marker zaczyna znikać z pola widzenia.
+    yaw_facing_rad: float = 0.0
     marker_id: int | None = None
     image_area_px: float = 0.0
     pose_quality: float = 0.0
@@ -304,6 +307,20 @@ class AprilTagDetector:
         return t_mean, R_ortho
 
     @staticmethod
+    def _yaw_from_marker_image(pose: _MarkerPose) -> float:
+        """Kurs z KSZTAŁTU kwadratu w obrazie — kąt lokalnej osi +X markera.
+
+        Rogi z detektora mają stałą kolejność związaną z orientacją tagu
+        (obj pts: 0=(-h,+h), 1=(+h,+h), 2=(+h,-h), 3=(-h,-h)), więc krawędzie
+        0->1 oraz 3->2 wskazują lokalne +X. Dla widoku z góry to rotacja w
+        płaszczyźnie obrazu: jednoznaczna i odporna na flip-ambiguity PnP,
+        która przy pojedynczym tagu potrafiła skokowo zmieniać yaw.
+        """
+        c = pose.corners.reshape(4, 2).astype(np.float64)
+        ex = ((c[1] - c[0]) + (c[2] - c[3])) * 0.5
+        return float(np.arctan2(ex[1], ex[0]))
+
+    @staticmethod
     def _yaw_from_image_layout(poses: list[_MarkerPose]) -> Optional[float]:
         by_id = {p.id: p for p in poses}
 
@@ -364,11 +381,11 @@ class AprilTagDetector:
                 hint=f"TOP: wykryto {seen}, ale estymacja pozy nieudana.",
             )
 
-        yaw, pitch, roll = _rotation_to_euler_zyx(R)
-        yaw_img = self._yaw_from_image_layout(poses)
-        if yaw_img is not None and len(poses) >= 2:
-            dy = np.arctan2(np.sin(yaw_img - yaw), np.cos(yaw_img - yaw))
-            yaw = _unwrap_yaw(yaw + 0.35 * dy)
+        _, pitch, roll = _rotation_to_euler_zyx(R)
+        # Kurs liczymy z kształtu markera referencyjnego w obrazie (stabilny dla
+        # widoku z góry), a NIE z yaw PnP (flip-ambiguity przy 1 tagu).
+        ref_pose = next((p for p in poses if p.id == reference_marker_id), poses[0])
+        yaw = self._yaw_from_marker_image(ref_pose)
 
         x_m, y_m, z_m = float(tvec[0]), float(tvec[1]), float(abs(tvec[2]))
 
@@ -429,6 +446,11 @@ class AprilTagDetector:
         tvec = best.tvec.reshape(3)
         R, _ = cv2.Rodrigues(best.rvec.reshape(3, 1))
         yaw_corr = float(np.arctan2(R[1, 0], R[0, 0]))
+        # Normalna markera (+Z obiektu) w układzie kamery; gdy marker patrzy wprost
+        # na kamerę, normalna jest ~(0,0,-1). Kąt poziomy normalnej = obrót drona w yaw
+        # względem kamery bocznej (0 = tag zwrócony do kamery).
+        normal = R[:, 2]
+        yaw_facing = float(np.arctan2(float(normal[0]), -float(normal[2])))
 
         return SideCorrectionObservation(
             ok=True,
@@ -436,10 +458,11 @@ class AprilTagDetector:
             y_m=float(-tvec[1]),
             z_m=float(abs(tvec[2])),
             yaw_rad=_unwrap_yaw(yaw_corr),
+            yaw_facing_rad=_unwrap_yaw(yaw_facing),
             marker_id=best.id,
             image_area_px=image_area_px,
             pose_quality=pose_quality,
             markers_seen=seen,
             marker_overlays=overlays,
-            hint=f"SIDE tag={best.id} area={image_area_px:.0f}px quality={pose_quality:.2f}",
+            hint=f"SIDE tag={best.id} area={image_area_px:.0f}px facing={np.degrees(yaw_facing):.0f}deg",
         )

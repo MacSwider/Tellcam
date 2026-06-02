@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Tuple
 
@@ -58,12 +58,15 @@ class AprilTagConfig:
 @dataclass
 class PIDGains:
     kp: float = 35.0
-    ki: float = 0.0
+    # Mały człon całkujący kompensuje stały dryf taniego Tello (do dostrojenia na sprzęcie).
+    ki: float = 4.0
     kd: float = 10.0
     output_limit: float = 20.0
-    integral_limit: float = 8.0
-    deadzone: float = 0.03
+    integral_limit: float = 10.0
+    deadzone: float = 0.02
     slew_rate: float = 80.0
+    # Minimalna skuteczna komenda RC, gdy błąd > deadzone (Tello ignoruje bardzo małe RC).
+    min_command: float = 6.0
 
 
 @dataclass
@@ -72,10 +75,19 @@ class ControllerConfig:
     pid_y: PIDGains = field(default_factory=PIDGains)
     pid_z: PIDGains = field(default_factory=lambda: PIDGains(kp=30.0, kd=8.0, deadzone=0.04, output_limit=18.0))
     pid_yaw: PIDGains = field(
-        default_factory=lambda: PIDGains(kp=25.0, kd=6.0, deadzone=0.08, output_limit=15.0)
+        default_factory=lambda: PIDGains(
+            kp=18.0, ki=0.0, kd=4.0, output_limit=12.0, integral_limit=6.0,
+            deadzone=0.06, slew_rate=60.0, min_command=0.0,
+        )
     )
     max_rc_abs: int = 20
     use_yaw: bool = False
+    # Znaki komend per oś — odwróć (-1.0), jeśli dron reaguje w przeciwną stronę.
+    # roll=left_right, pitch=forward_back, throttle=up_down, yaw.
+    roll_sign: float = 1.0
+    pitch_sign: float = 1.0
+    throttle_sign: float = 1.0
+    yaw_sign: float = 1.0
 
 
 @dataclass
@@ -91,16 +103,74 @@ class StabilizationConfig:
     demo_side_only: bool = False
     control_frame: str = "top"
     enabled_axes: Tuple[str, ...] = ("x", "y", "z")
-    use_yaw: bool = False
+    # Stabilizacja obrotu, by dron nie wirował. Źródło yaw:
+    #   "top"  – kurs z KSZTAŁTU tagu 0 widzianego z góry (kąt krawędzi w obrazie;
+    #            jednoznaczny dla widoku z góry),
+    #   "side" – kurs z tagów bocznych 1–4 w UKŁADZIE (yaw_facing − azymut tagu;
+    #            ciągły przy zmianie widocznego tagu),
+    #   "auto" – TOP gdy dostępny, w przeciwnym razie SIDE (równolegle/awaryjnie),
+    #   "off"  – bez sterowania yaw.
+    use_yaw: bool = True
+    yaw_source: str = "auto"
+    # Min. liczba markerów TOP do uznania kursu za wiarygodny. Dla widoku z GÓRY
+    # obrót (yaw) to rotacja W PŁASZCZYŹNIE — dobrze obserwowalna już z 1 markera
+    # (tag 0). Przy ≥2 markerach kurs jest dodatkowo wspierany układem (front/tył).
+    yaw_top_min_markers: int = 1
+    # Azymut „na zewnątrz” każdego bocznego tagu w układzie ciała (deg), patrząc z
+    # GÓRY (przód=0°, CCW dodatnie). Layout:
+    #        PRZÓD
+    #     [4]     [1]
+    #         [0]
+    #     [3]     [2]
+    #         TYŁ
+    # Dzięki azymutowi kurs z kamery bocznej jest CIĄGŁY przy przełączaniu tagów
+    # (heading = side_yaw_sign * (yaw_facing − azymut[id])). Jeśli przy obrocie
+    # przez granicę tagów kurs SKACZE o ~90°, odwróć kolejność (zaneguj znaki).
+    side_tag_azimuths_deg: dict = field(
+        default_factory=lambda: {1: -45.0, 2: -135.0, 3: 135.0, 4: 45.0}
+    )
+    # Globalny znak kursu z kamery bocznej (gdy obrót drona daje przeciwny kierunek).
+    side_yaw_sign: float = 1.0
+    # Stałe przesunięcie kursu bocznego [deg] — czysto kosmetyczne (zerowanie panelu).
+    # Nie wpływa na sterowanie (cel yaw przechwytywany względnie), ułatwia kalibrację:
+    # ustaw drona „przodem do kamery bocznej”, odczytaj side_hdg=X, wpisz tu −X.
+    side_yaw_offset_deg: float = 0.0
+    # Obróć błąd pozycji do układu ciała drona wg kursu (TOP) zanim trafi na roll/pitch.
+    # Bez tego, gdy dron zdryfuje w yaw, komendy idą w złą stronę -> łuk/ucieczka.
+    body_frame_control: bool = True
+    # Powyżej tego błędu kursu mocno ogranicz ruch poziomy (najpierw wyrównaj yaw).
+    yaw_align_deg_for_translation: float = 35.0
     top_reference_tag_id: int = 0
+    # Źródło wysokości (oś up/down): "side" = pionowa pozycja z kamery bocznej,
+    # "top" = odległość od kamery górnej (gdy brak kamery bocznej).
+    altitude_source: str = "side"
+    # Hold „w miejscu”: cel = bieżąca poza w chwili wejścia w fazę HOLD.
+    hold_capture_on_enter: bool = True
     target_pose_m: TargetConfig = field(default_factory=TargetConfig)
 
 
 @dataclass
+class ClimbConfig:
+    """Otwarta pętla wznoszenia po starcie, zanim kamery złapią znaczniki."""
+    target_height_m: float = 1.5
+    rc_up: int = 25
+    timeout_s: float = 6.0
+    settle_s: float = 1.0
+    require_top_and_side: bool = True
+
+
+@dataclass
 class TrackingConfig:
-    hold_last_pose_s: float = 0.6
-    lost_timeout_s: float = 1.5
-    pose_lowpass_alpha: float = 0.35
+    # Okno podtrzymania ostatniej pozy przy krótkiej utracie znacznika (1–2 s).
+    hold_last_pose_s: float = 0.8
+    lost_timeout_s: float = 2.0
+    pose_lowpass_alpha: float = 0.35  # używane dla yaw (alfa-beta dla x/y/z)
+    # Filtr alfa-beta (estymacja pozycji + prędkości z detekcji) i predykcja.
+    predict_enabled: bool = True
+    filter_alpha: float = 0.6   # waga korekty pozycji (0..1)
+    filter_beta: float = 0.2    # waga korekty prędkości (0..1)
+    max_predict_s: float = 0.4  # max horyzont ekstrapolacji w dziurze detekcji
+    max_speed_m_s: float = 1.5  # limit estymowanej prędkości (odrzut szumu)
 
 
 @dataclass
@@ -140,6 +210,7 @@ class AppConfig:
     controller: ControllerConfig = field(default_factory=ControllerConfig)
     target: TargetConfig = field(default_factory=TargetConfig)
     stabilization: StabilizationConfig = field(default_factory=StabilizationConfig)
+    climb: ClimbConfig = field(default_factory=ClimbConfig)
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     gui: GuiConfig = field(default_factory=GuiConfig)
@@ -150,7 +221,8 @@ class AppConfig:
 
 def _deep_update(obj, updates: dict) -> None:
     for k, v in updates.items():
-        if hasattr(obj, k) and isinstance(v, dict) and not isinstance(getattr(obj, k), (tuple, type(None))):
+        # Rekuruj tylko w zagnieżdżone dataclass; zwykłe dict (np. mapy) podmień w całości.
+        if hasattr(obj, k) and isinstance(v, dict) and is_dataclass(getattr(obj, k)):
             _deep_update(getattr(obj, k), v)
         elif hasattr(obj, k):
             setattr(obj, k, v)

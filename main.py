@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import queue
 import sys
 import time
@@ -10,6 +11,7 @@ import cv2
 
 from config import AppConfig, load_config
 from controller import DroneController
+from flight_director import FlightDirector
 from state_estimator import DroneState
 from tello_interface import TelloConfig, TelloController
 from trajectory_planner import FutureTrajectoryPlanner, TrajectoryPoint
@@ -116,6 +118,7 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
         )
     )
     controller = DroneController(cfg.controller, static_target, cfg.stabilization, cfg.safety)
+    director = FlightDirector(controller, cfg.stabilization, cfg.climb, cfg.safety)
     tello = TelloController(
         TelloConfig(
             mock=args.mock_tello,
@@ -139,17 +142,9 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
             log.warning("Brak Tello przy starcie — START spróbuje ponownie.")
 
     def on_control_tick(state: DroneState, top_obs, side_obs, dt: float) -> list[str]:
+        now = time.perf_counter()
         telemetry = tello.get_snapshot()
-        planner_target = planner.peek_target()
         top_ref_seen = reference_tag_id in top_obs.markers_seen
-        controller.set_target(
-            type(static_target)(
-                x_m=planner_target.x_m,
-                y_m=planner_target.y_m,
-                z_m=planner_target.z_m,
-                yaw_rad=planner_target.yaw_rad,
-            )
-        )
 
         pipeline = on_control_tick._pipeline  # type: ignore[attr-defined]
         shared = pipeline.shared
@@ -167,48 +162,59 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
             elif action == "takeoff":
                 if _ensure_tello() and not tello.flying:
                     tello.takeoff()
-                    controller.reset()
-                    log.info("GUI: takeoff")
+                    director.start_flight(time.perf_counter())
+                    log.info("GUI: takeoff -> wznoszenie")
             elif action == "land":
                 if tello.connected and tello.flying:
+                    director.request_land()
                     tello.send_rc_zero(force=True, hover_reason="land")
                     tello.land()
-                    controller.reset()
+                    director.reset()
                     log.info("GUI: land")
             elif action == "emergency":
                 if tello.connected:
                     tello.emergency_stop()
-                    controller.reset()
+                    director.reset()
                     log.warning("GUI: emergency stop")
 
-        if state.valid and telemetry.flying and cfg.control_enabled and tello.connected:
-            cmd = controller.compute(
-                state.x_m,
-                state.y_m,
-                state.z_m,
-                state.yaw_rad,
-                dt,
-                freeze_integrators=(state.tracking_state != "TRACKING"),
+        preview_mode = False
+        if telemetry.flying and cfg.control_enabled and tello.connected:
+            height_m = tello.get_height_m()
+            cmd = director.update(state, height_m, dt, now)
+            tello.send_rc(cmd, hover_reason=director.reason)
+        elif cfg.control_enabled and state.valid and not telemetry.flying:
+            # KALIBRACJA NA ZIEMI: licz komendę względem celu (środek kadru),
+            # bez wysyłania do drona — tylko po to, by odświeżyć podgląd.
+            preview_mode = True
+            controller.set_target(static_target)
+            controller.compute(
+                state.x_m, state.y_m, state.z_m, state.yaw_rad, dt,
+                active_axes=state.active_axes, freeze_axes=state.freeze_axes,
+                vx=state.vx_m_s, vy=state.vy_m_s, vz=state.vz_m_s,
+                heading_rad=state.heading_rad, heading_valid=state.heading_valid,
             )
-            tello.send_rc(cmd)
-        elif telemetry.flying and cfg.control_enabled and tello.connected and cfg.safety.zero_rc_on_loss:
-            tello.send_rc_zero(hover_reason=f"tracking_{state.tracking_state.lower()}")
-            if state.tracking_state in {"LOST", "TIMED_OUT"}:
-                controller.reset()
 
         telemetry = tello.get_snapshot()
+        tgt = controller.last_debug.target
         status_lines = [
             (
-                f"tracking={state.tracking_state} valid={state.valid} "
-                f"ref_tag={reference_tag_id} top_ref={'YES' if top_ref_seen else 'NO'}"
+                f"phase={director.phase} ({director.reason})"
+            ),
+            (
+                f"track top={state.top_state} side={state.side_state} valid={state.valid} "
+                f"axes={'/'.join(state.active_axes) or '-'} ref_tag={reference_tag_id} "
+                f"top_ref={'YES' if top_ref_seen else 'NO'}"
             ),
             (
                 f"pose x={state.x_m:+.2f}m y={state.y_m:+.2f}m "
                 f"z={state.z_m:.2f}m yaw={state.yaw_rad:+.2f}rad age={state.pose_age_s:.2f}s"
             ),
             (
-                f"target x={planner_target.x_m:+.2f}m y={planner_target.y_m:+.2f}m "
-                f"z={planner_target.z_m:.2f}m yaw={planner_target.yaw_rad:+.2f}rad"
+                f"vel vx={state.vx_m_s:+.2f} vy={state.vy_m_s:+.2f} vz={state.vz_m_s:+.2f} m/s (predykcja)"
+            ),
+            (
+                f"target x={tgt.x_m:+.2f}m y={tgt.y_m:+.2f}m "
+                f"z={tgt.z_m:.2f}m yaw={tgt.yaw_rad:+.2f}rad"
             ),
             (
                 f"tello={'OK' if telemetry.connected else 'OFF'} flight={'ON' if telemetry.flying else 'OFF'} "
@@ -226,23 +232,37 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
         ]
 
         debug = controller.last_debug
+        yaw_on = "yaw" in state.active_axes
+        status_lines.append(
+            f"yaw src={cfg.stabilization.yaw_source} active={'YES' if yaw_on else 'NO'} "
+            f"heading={math.degrees(state.heading_rad):+.0f}deg hv={'YES' if state.heading_valid else 'NO'} "
+            f"target={math.degrees(debug.target.yaw_rad):+.0f}deg yaw_sign={cfg.controller.yaw_sign:+.0f}"
+        )
+        status_lines.append(
+            f"side_hdg={math.degrees(state.side_heading_rad):+.0f}deg "
+            f"sv={'YES' if state.side_heading_valid else 'NO'} "
+            f"side_tag={side_obs.marker_id if side_obs.marker_id is not None else '-'} "
+            f"facing={math.degrees(side_obs.yaw_facing_rad):+.0f}deg"
+        )
+        status_lines.append(
+            f"signs roll={cfg.controller.roll_sign:+.0f} pitch={cfg.controller.pitch_sign:+.0f} "
+            f"thr={cfg.controller.throttle_sign:+.0f} | body_frame={cfg.stabilization.body_frame_control}"
+        )
         if cfg.gui.show_pid_debug:
-            if cfg.stabilization.control_frame.strip().lower() == "top":
-                pid_line = (
-                    f"pid lr={debug.lateral.output:+.1f}({debug.lateral.error:+.2f}) "
-                    f"fb={debug.vertical.output:+.1f}({debug.vertical.error:+.2f}) "
-                    f"ud={debug.distance.output:+.1f}({debug.distance.error:+.2f}) "
-                    f"yaw={debug.yaw.output:+.1f}({debug.yaw.error:+.2f})"
-                )
-            else:
-                pid_line = (
-                    f"pid lr={debug.lateral.output:+.1f}({debug.lateral.error:+.2f}) "
-                    f"ud={debug.vertical.output:+.1f}({debug.vertical.error:+.2f}) "
-                    f"fb={debug.distance.output:+.1f}({debug.distance.error:+.2f}) "
-                    f"yaw={debug.yaw.output:+.1f}({debug.yaw.error:+.2f})"
-                )
+            tag = "PID PODGLAD(nie wysylane)" if preview_mode else "pid"
             status_lines.append(
-                pid_line
+                f"{tag} lr={debug.left_right.output:+.1f}(e={debug.left_right.error:+.2f}) "
+                f"fb={debug.forward_back.output:+.1f}(e={debug.forward_back.error:+.2f}) "
+                f"ud={debug.up_down.output:+.1f}(e={debug.up_down.error:+.2f}) "
+                f"yaw={debug.yaw.output:+.1f}(e={debug.yaw.error:+.2f})"
+            )
+        if preview_mode:
+            status_lines.append(
+                "KALIBRACJA (dron w rece, w kadrze TOP). RC+ = lr:PRAWO fb:PRZOD ud:GORA yaw:CW."
+            )
+            status_lines.append(
+                "Przesun drona w dana strone -> komenda ma byc PRZECIWNA (wraca do srodka). "
+                "Jesli ZGODNA (ucieka) -> odwroc znak osi: roll/pitch/throttle/yaw_sign."
             )
         if state.hint:
             status_lines.append(f"tracking_hint={state.hint}")

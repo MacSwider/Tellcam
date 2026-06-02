@@ -437,11 +437,17 @@ class PreviewGUI(threading.Thread):
         self._side_enabled = side_enabled
         self.button_rect: Tuple[int, int, int, int] = (0, 0, 0, 0)
         self.button_rects: dict[str, Tuple[int, int, int, int]] = {}
+        self._disp_scale = 1.0
         self.preview_hz = 0.0
 
     def _on_mouse(self, event, x, y, flags, param) -> None:
         del flags, param
         if event == cv2.EVENT_LBUTTONDOWN:
+            # Współrzędne kliknięcia są w przestrzeni wyświetlanego (przeskalowanego)
+            # obrazu — przelicz na współrzędne panelu, w których zapisano przyciski.
+            scale = self._disp_scale if self._disp_scale > 0 else 1.0
+            x = int(x / scale)
+            y = int(y / scale)
             for action, (x0, y0, x1, y1) in self.button_rects.items():
                 if x0 <= x <= x1 and y0 <= y <= y1:
                     try:
@@ -555,11 +561,14 @@ class PreviewGUI(threading.Thread):
                 disp = panel
                 if self._preview_max_width and disp.shape[1] > self._preview_max_width:
                     scale = self._preview_max_width / float(disp.shape[1])
+                    self._disp_scale = scale
                     disp = cv2.resize(
                         disp,
                         (int(disp.shape[1] * scale), int(disp.shape[0] * scale)),
                         interpolation=cv2.INTER_AREA,
                     )
+                else:
+                    self._disp_scale = 1.0
                 cv2.imshow(self._window_name, disp)
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     self._shared.stop.set()
@@ -657,7 +666,7 @@ def build_vision_pipeline(
     control = ControlLoop(
         shared,
         pipeline_cfg,
-        StateEstimator(cfg.tracking),
+        StateEstimator(cfg.tracking, cfg.stabilization),
         on_tick=on_control_tick,
         top_detection=top_detection,
         side_detection=side_detection,
