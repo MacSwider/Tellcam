@@ -117,6 +117,25 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
             yaw_rad=static_target.yaw_rad,
         )
     )
+    # --- Ścieżka lotu (scaffolding) -----------------------------------------
+    # Domyślnie HOLD: dron trzyma jeden punkt (TOP+SIDE). Gdy w configu podano
+    # plik ścieżki, wczytujemy go i przygotowujemy waypointy w planerze. Samo
+    # lecenie po ścieżce nie jest jeszcze podpięte do FlightDirectora (HOLD nadal
+    # rządzi) — to miejsce na przyszłe rozszerzenie nawigacji po waypointach.
+    nav = cfg.navigation
+    if nav.flight_path_path:
+        try:
+            waypoints = planner.load_path_from_file(
+                planner.peek_target(), nav.flight_path_path, nav.units_to_meter
+            )
+            log.info(
+                "Wczytano ścieżkę lotu: %d waypointów z %s (mode=%s, 1 jednostka=%.2f m)",
+                len(waypoints), nav.flight_path_path, nav.mode, nav.units_to_meter,
+            )
+            if nav.mode.strip().lower() != "path":
+                log.info("navigation.mode=%s -> lot pozostaje w trybie HOLD (ścieżka tylko wczytana).", nav.mode)
+        except (FileNotFoundError, ValueError) as e:
+            log.error("Ścieżka lotu: %s — pozostaję w trybie HOLD.", e)
     controller = DroneController(cfg.controller, static_target, cfg.stabilization, cfg.safety)
     director = FlightDirector(controller, cfg.stabilization, cfg.climb, cfg.safety)
     tello = TelloController(

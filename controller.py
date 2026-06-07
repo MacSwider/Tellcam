@@ -225,6 +225,29 @@ class StabilizationController:
             yaw=self._quantize(yaw_cmd),
         )
 
+    def compute_yaw_command(
+        self,
+        yaw_rad: float,
+        target_yaw_rad: float,
+        dt: float,
+        *,
+        freeze_integrator: bool = False,
+    ) -> int:
+        """Tylko korekcja yaw (np. w fazie wznoszenia) — bez roll/pitch/throttle.
+
+        Pozwala stabilizować kurs zanim ruszy pełna pętla pozycji, żeby dron nie
+        zdążył się rozkręcić (anti-spin). Zwraca skwantowaną komendę RC yaw.
+        """
+        if not (self._cfg.use_yaw and self._stabilization_cfg.use_yaw):
+            self.pid_yaw.reset()
+            return 0
+        eyaw = self._angle_diff(target_yaw_rad, yaw_rad)
+        yaw_cmd = float(self._cfg.yaw_sign) * self.pid_yaw.step(
+            eyaw, dt, freeze_integrator=freeze_integrator
+        )
+        self.last_debug.yaw = AxisDebug(error=eyaw, output=yaw_cmd)
+        return self._quantize(yaw_cmd)
+
     def _axis_output(
         self,
         axis_name: str,

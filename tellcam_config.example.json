@@ -59,7 +59,19 @@
     "top_reference_tag_id": 0,
     "altitude_source": "side",
     "hold_capture_on_enter": true,
+    "yaw_lock_on_takeoff": true,
+    "yaw_reference_offset_deg": 0.0,
+    "yaw_control_during_climb": true,
+    "spin_rate_limit_deg_s": 50.0,
     "target_pose_m": { "x_m": 0.0, "y_m": 0.0, "z_m": 0.8, "yaw_rad": 0.0 }
+  },
+  "navigation": {
+    "mode": "hold",
+    "flight_path_path": null,
+    "units_to_meter": 1.0,
+    "waypoint_radius_m": 0.15,
+    "waypoint_yaw_tol_deg": 8.0,
+    "waypoint_settle_s": 0.5
   },
   "climb": {
     "target_height_m": 1.5,

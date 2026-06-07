@@ -148,6 +148,47 @@ class StabilizationConfig:
     hold_capture_on_enter: bool = True
     target_pose_m: TargetConfig = field(default_factory=TargetConfig)
 
+    # --- Anti-spin: zapobieganie niekontrolowanemu obrotowi (wirowaniu) ---
+    # Kurs jest stabilizowany od pierwszej widocznej klatki (także w fazie CLIMB),
+    # a cel yaw jest „zatrzaśnięty” względem orientacji TAG 0 zmierzonej przy starcie.
+    # Dzięki temu nie trzeba ręcznie ustawiać tagu idealnie prostopadle do kamery —
+    # mierzymy faktyczny kurs startowy i utrzymujemy go przez cały lot.
+    yaw_lock_on_takeoff: bool = True
+    # Przesunięcie celu yaw względem zatrzaśniętego kursu startowego [deg].
+    # 0 = trzymaj dokładnie orientację z chwili startu.
+    yaw_reference_offset_deg: float = 0.0
+    # Koryguj yaw już podczas wznoszenia (CLIMB), zanim dron zdąży się rozkręcić.
+    yaw_control_during_climb: bool = True
+    # Watchdog wirowania: powyżej tej prędkości kątowej [deg/s] wchodzimy w tryb
+    # anti-spin — priorytet ma korekcja yaw, a ruch poziomy (roll/pitch) jest tłumiony,
+    # by dron nie „uciekł” łukiem podczas obrotu. 0 = watchdog wyłączony.
+    spin_rate_limit_deg_s: float = 50.0
+
+
+@dataclass
+class NavigationConfig:
+    """
+    Tryb nawigacji i (opcjonalna) ścieżka lotu.
+
+    - "hold"  – DOMYŚLNIE: dron trzyma jeden punkt w przestrzeni (fuzja TOP+SIDE).
+    - "path"  – nawigacja po waypointach wczytanych z pliku (na razie scaffolding —
+                pętla lotu nadal działa w trybie HOLD, dopóki nie zostanie podpięta).
+
+    Plik ścieżki opisuje RUCHY WZGLĘDNE w układzie ciała drona (patrząc z góry):
+        forward_m  (+przód),  left_m (+lewo),  up_m (+góra),  turn_deg (+CCW),
+    gdzie wartość 1 oznacza 1 metr (skalowane przez `units_to_meter`).
+    """
+    mode: str = "hold"  # "hold" | "path"
+    # Plik JSON z listą kroków ścieżki (ruchy względne + obroty). None = brak.
+    flight_path_path: str | None = None
+    # Skala jednostek z pliku na metry: 1 w pliku = 1 m, gdy units_to_meter=1.0.
+    units_to_meter: float = 1.0
+    # Próg uznania waypointu za osiągnięty (pozycja [m] i kurs [deg]).
+    waypoint_radius_m: float = 0.15
+    waypoint_yaw_tol_deg: float = 8.0
+    # Postój nad każdym waypointem zanim przejdziemy do kolejnego [s].
+    waypoint_settle_s: float = 0.5
+
 
 @dataclass
 class ClimbConfig:
@@ -210,6 +251,7 @@ class AppConfig:
     controller: ControllerConfig = field(default_factory=ControllerConfig)
     target: TargetConfig = field(default_factory=TargetConfig)
     stabilization: StabilizationConfig = field(default_factory=StabilizationConfig)
+    navigation: NavigationConfig = field(default_factory=NavigationConfig)
     climb: ClimbConfig = field(default_factory=ClimbConfig)
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
