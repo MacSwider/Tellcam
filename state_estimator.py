@@ -1,26 +1,23 @@
 """
-Fuzja pozy dla demo TOP+SIDE z filtrem alfa-beta (pozycja + prędkość) i predykcją.
-
-Założenia fizyczne (dwie zewnętrzne kamery USB obserwujące drona z tagami):
-- Kamera GÓRNA (TOP) najlepiej mierzy pozycję poziomą: x (lewo/prawo), y (przód/tył) i yaw.
-- Kamera BOCZNA (SIDE) najlepiej mierzy WYSOKOŚĆ drona (pionowa pozycja = side.y_m).
-
-Każda oś (x, y z TOP; altitude z SIDE) ma filtr alfa-beta, który:
-- estymuje prędkość z kolejnych detekcji,
-- przewiduje pozycję między detekcjami i w krótkich dziurach (do max_predict_s),
-co skraca opóźnienie sprzężenia i pozwala wcześniej tłumić dryf drona.
-
-Stany źródła: TRACKING -> HOLDING_LAST -> LOST -> TIMED_OUT (per kamera).
+TOP+SIDE pose fusion with alpha-beta filter (position + velocity) and prediction.
+Optional complementary fusion with Tello body velocities between AprilTag updates.
+Physical assumptions (two external USB cameras observing a tagged drone):
+- TOP camera best measures horizontal position: x (left/right), y (forward/back), yaw.
+- SIDE camera best measures drone ALTITUDE (vertical position = side.y_m).
+  When face_to_face at takeoff, SIDE depth/area also reflects approach toward the camera (pitch).
+Each axis (x, y from TOP; altitude from SIDE) has an alpha-beta filter that:
+- estimates velocity from successive detections,
+- predicts position between detections and in short gaps (up to max_predict_s),
+- blends Tello odometry velocity between vision frames when enabled,
+reducing control delay and damping drift earlier.
+Source states: TRACKING -> HOLDING_LAST -> LOST -> TIMED_OUT (per camera).
 """
 
 from __future__ import annotations
-
 from dataclasses import dataclass, field
-
 import numpy as np
-
 from apriltag_detector import SideCorrectionObservation, TopPoseObservation
-from config import StabilizationConfig, TrackingConfig
+from config import OdometryFusionConfig, StabilizationConfig, TrackingConfig
 
 TRACKING = "TRACKING"
 HOLDING_LAST = "HOLDING_LAST"
@@ -40,10 +37,10 @@ class DroneState:
     vx_m_s: float = 0.0
     vy_m_s: float = 0.0
     vz_m_s: float = 0.0
-    # Kurs drona (do transformacji do układu ciała): TOP, awaryjnie wyrównany SIDE.
+    # Drone heading (for body-frame transform): TOP, fallback aligned SIDE.
     heading_rad: float = 0.0
     heading_valid: bool = False
-    # Surowy kurs z kamery bocznej (layout tagów 1–4) — do diagnostyki/podglądu.
+    # Raw heading from side camera (tags 1–4 layout) — for diagnostics/preview.
     side_heading_rad: float = 0.0
     side_heading_valid: bool = False
     top_ok: bool = False
@@ -57,10 +54,40 @@ class DroneState:
     measurement_age_s: float = 0.0
     marker_id: int | None = None
     hint: str | None = None
+    # SIDE camera measurements for image point/distance hold.
+    side_u_px: float = 0.0
+    side_v_px: float = 0.0
+    side_area_px: float = 0.0
+    side_z_m: float = 0.0
+    side_x_m: float = 0.0
+    side_vu_px_s: float = 0.0
+    side_vv_px_s: float = 0.0
+    side_vz_m_s: float = 0.0
+    side_vx_m_s: float = 0.0
+    side_marker_id: int | None = None
+    top_u_px: float = 0.0
+    top_v_px: float = 0.0
+    top_vu_px_s: float = 0.0
+    top_vv_px_s: float = 0.0
+    odom_fusion_active: bool = False
+    odom_vx_m_s: float = 0.0
+    odom_vy_m_s: float = 0.0
+    odom_vz_m_s: float = 0.0
+
+
+@dataclass
+class OdometrySample:
+    """Body-frame velocity sample for complementary fusion."""
+
+    vx_m_s: float = 0.0
+    vy_m_s: float = 0.0
+    vz_m_s: float = 0.0
+    valid: bool = False
+    flying: bool = False
 
 
 class AlphaBetaAxis:
-    """Filtr alfa-beta: estymuje pozycję i prędkość, przewiduje w czasie."""
+    """Alpha-beta filter: estimates position and velocity, predicts over time."""
 
     def __init__(self, alpha: float, beta: float, max_speed: float) -> None:
         self.alpha = float(alpha)
@@ -92,7 +119,7 @@ class AlphaBetaAxis:
         self.t = t
 
     def predict(self, t: float, max_horizon: float) -> float:
-        """Pozycja przewidziana na czas t (ekstrapolacja prędkością, z limitem horyzontu)."""
+        """Position predicted at time t (velocity extrapolation, horizon limited)."""
         if self.x is None:
             return 0.0
         horizon = min(max(0.0, t - self.t), max_horizon)
@@ -104,10 +131,21 @@ class PoseEstimator:
         self._cfg = cfg
         self._stab = stab_cfg or StabilizationConfig()
         a, b, vmax = cfg.filter_alpha, cfg.filter_beta, cfg.max_speed_m_s
-        self._fx = AlphaBetaAxis(a, b, vmax)
-        self._fy = AlphaBetaAxis(a, b, vmax)
+        a_xy = float(getattr(cfg, "filter_alpha_xy", a))
+        b_xy = float(getattr(cfg, "filter_beta_xy", b))
+        self._fx = AlphaBetaAxis(a_xy, b_xy, vmax)
+        self._fy = AlphaBetaAxis(a_xy, b_xy, vmax)
         self._falt = AlphaBetaAxis(a, b, vmax)
         self._ftop_z = AlphaBetaAxis(a, b, vmax)
+        self._fside_u = AlphaBetaAxis(a, b, vmax * 500.0)  # px/s
+        self._fside_v = AlphaBetaAxis(a, b, vmax * 500.0)
+        self._fside_area = AlphaBetaAxis(a, b, vmax * 1e6)
+        self._fside_z = AlphaBetaAxis(a, b, vmax)
+        self._fside_x = AlphaBetaAxis(a, b, vmax)
+        self._top_image_hold = bool(getattr(self._stab, "top_image_hold", False))
+        self._ftop_u = AlphaBetaAxis(a, b, vmax * 500.0)
+        self._ftop_v = AlphaBetaAxis(a, b, vmax * 500.0)
+        self._side_image_hold = bool(getattr(self._stab, "side_image_hold", False))
         self._top_ts = 0.0
         self._side_ts = 0.0
         self._top_meas_ts = 0.0
@@ -116,23 +154,69 @@ class PoseEstimator:
         self._pitch = 0.0
         self._roll = 0.0
         self._side_facing = 0.0
-        self._side_heading = 0.0  # ciągły kurs z layoutu tagów bocznych
+        self._side_heading = 0.0  # continuous heading from side tag layout
         self._has_side_heading = False
-        self._side_to_top_offset = 0.0  # wyrównanie kursu SIDE do ramki TOP
+        self._side_to_top_offset = 0.0  # SIDE->TOP heading alignment
         self._has_offset = False
         self._top_n = 0
         self._yaw_source = (self._stab.yaw_source or "off").strip().lower()
         self._use_yaw = bool(self._stab.use_yaw)
         self._side_yaw_sign = float(getattr(self._stab, "side_yaw_sign", 1.0))
         self._side_yaw_offset = np.radians(float(getattr(self._stab, "side_yaw_offset_deg", 0.0)))
-        # Azymuty „na zewnątrz” tagów bocznych [rad], klucze jako int.
+        # Outward azimuths of side tags [rad], keys as int.
         az = getattr(self._stab, "side_tag_azimuths_deg", {}) or {}
         self._side_azimuth = {int(k): np.radians(float(v)) for k, v in az.items()}
         self._has_top = False
         self._has_side = False
+        self._odom_cfg: OdometryFusionConfig = cfg.odometry
+
+    def _side_image_enabled(
+        self, top_usable: bool, side_usable: bool, side_state: str
+    ) -> bool:
+        if not self._side_image_hold:
+            return False
+        side_live = side_usable and side_state in (TRACKING, HOLDING_LAST)
+        if bool(getattr(self._stab, "side_primary_horiz", False)):
+            return side_live
+        if bool(getattr(self._stab, "top_primary_horiz", True)):
+            return side_live and not top_usable
+        return side_live
+
+    def _top_image_enabled(
+        self,
+        top_usable: bool,
+        side_usable: bool,
+        top_state: str,
+        side_state: str,
+    ) -> bool:
+        if not self._top_image_hold:
+            return False
+        top_live = top_usable and top_state in (TRACKING, HOLDING_LAST)
+        if bool(getattr(self._stab, "side_primary_horiz", False)):
+            side_live = (
+                self._side_image_hold
+                and side_usable
+                and side_state in (TRACKING, HOLDING_LAST)
+            )
+            if side_live:
+                return False
+            return top_live
+        return top_live
 
     def reset(self) -> None:
-        for f in (self._fx, self._fy, self._falt, self._ftop_z):
+        for f in (
+            self._fx,
+            self._fy,
+            self._falt,
+            self._ftop_z,
+            self._fside_u,
+            self._fside_v,
+            self._fside_area,
+            self._fside_z,
+            self._fside_x,
+            self._ftop_u,
+            self._ftop_v,
+        ):
             f.reset()
         self._top_ts = self._side_ts = 0.0
         self._top_meas_ts = self._side_meas_ts = 0.0
@@ -153,15 +237,18 @@ class PoseEstimator:
         top_ts: float = 0.0,
         side_ts: float = 0.0,
         now: float = 0.0,
+        odometry: OdometrySample | None = None,
     ) -> DroneState:
         predict = bool(self._cfg.predict_enabled)
         max_h = float(self._cfg.max_predict_s)
-
-        # --- TOP: nowy pomiar tylko gdy zmienił się znacznik czasu publikacji ---
+        # --- TOP: new measurement only when publish timestamp changes ---
         if top.ok and top_ts > self._top_ts:
             self._fx.update(float(top.x_m), now)
             self._fy.update(float(top.y_m), now)
             self._ftop_z.update(float(top.z_m), now)
+            if self._top_image_hold:
+                self._ftop_u.update(float(top.centroid_u_px), now)
+                self._ftop_v.update(float(top.centroid_v_px), now)
             self._yaw = self._unwrap_yaw(float(top.yaw_rad))
             self._pitch = float(top.pitch_rad)
             self._roll = float(top.roll_rad)
@@ -169,16 +256,23 @@ class PoseEstimator:
             self._top_ts = top_ts
             self._top_meas_ts = now
             self._has_top = True
-        top_state = TRACKING if (top.ok and now - self._top_meas_ts <= 1e-6) else (
-            self._state_for_age(now - self._top_meas_ts) if self._has_top else LOST
+        top_state = (
+            TRACKING
+            if (top.ok and now - self._top_meas_ts <= 1e-6)
+            else (self._state_for_age(now - self._top_meas_ts) if self._has_top else LOST)
         )
-
-        # --- SIDE: wysokość (pionowa pozycja = side.y_m) + kurs z layoutu tagów ---
+        # --- SIDE: altitude + heading + (optional) image point/distance ---
         if side.ok and side_ts > self._side_ts:
             self._falt.update(float(side.y_m), now)
+            self._fside_x.update(float(side.x_m), now)
+            self._fside_z.update(float(side.z_m), now)
+            if self._side_image_hold:
+                self._fside_u.update(float(side.centroid_u_px), now)
+                self._fside_v.update(float(side.centroid_v_px), now)
+                self._fside_area.update(float(side.image_area_px), now)
             self._side_facing = self._lowpass_angle(self._side_facing, float(side.yaw_facing_rad))
-            # Kurs ciągły: yaw_facing tagu skorygowany jego azymutem w układzie.
-            # Dzięki temu przy przełączeniu widocznego tagu nie ma skoku ~90°.
+            # Continuous heading: tag yaw_facing corrected by layout azimuth.
+            # Avoids ~90° jump when the visible tag switches.
             mid = int(side.marker_id) if side.marker_id is not None else -1
             az = self._side_azimuth.get(mid)
             if az is not None:
@@ -193,56 +287,20 @@ class PoseEstimator:
             self._side_ts = side_ts
             self._side_meas_ts = now
             self._has_side = True
-        side_state = TRACKING if (side.ok and now - self._side_meas_ts <= 1e-6) else (
-            self._state_for_age(now - self._side_meas_ts) if self._has_side else LOST
+        side_state = (
+            TRACKING
+            if (side.ok and now - self._side_meas_ts <= 1e-6)
+            else (self._state_for_age(now - self._side_meas_ts) if self._has_side else LOST)
         )
-
         top_usable = top_state in (TRACKING, HOLDING_LAST)
         side_usable = side_state in (TRACKING, HOLDING_LAST)
         alt_from_side = self._stab.altitude_source.strip().lower() == "side"
-
-        # Predykcja pozycji na bieżącą chwilę (skraca opóźnienie, łapie dryf wcześniej).
-        if self._has_top:
-            x_m = self._fx.predict(now, max_h) if predict else (self._fx.x or 0.0)
-            y_m = self._fy.predict(now, max_h) if predict else (self._fy.x or 0.0)
-            vx, vy = self._fx.v, self._fy.v
-            top_z = self._ftop_z.predict(now, max_h) if predict else (self._ftop_z.x or 0.0)
-        else:
-            x_m = y_m = vx = vy = top_z = 0.0
-
-        if alt_from_side and self._has_side:
-            z_m = self._falt.predict(now, max_h) if predict else (self._falt.x or 0.0)
-            vz = self._falt.v
-            z_state, z_usable = side_state, side_usable
-        elif not alt_from_side and self._has_top:
-            z_m, vz = top_z, self._ftop_z.v
-            z_state, z_usable = top_state, top_usable
-        else:
-            z_m, vz = 0.0, 0.0
-            z_state, z_usable = side_state if alt_from_side else top_state, False
-
-        # Predykcja ufana tylko do max_predict_s; dalej w oknie hold -> trzymaj, zamroź integrator.
         top_predicting = (now - self._top_meas_ts) <= max_h
-        z_predicting = (now - (self._side_meas_ts if alt_from_side else self._top_meas_ts)) <= max_h
-
-        active: list[str] = []
-        freeze: list[str] = []
-        if top_usable:
-            active.extend(["x", "y"])
-            if not top_predicting:
-                freeze.extend(["x", "y"])
-                vx = vy = 0.0
-        if z_usable:
-            active.append("z")
-            if not z_predicting:
-                freeze.append("z")
-                vz = 0.0
-
-        # --- yaw: kurs z TOP (kształt tagu 0) i/lub SIDE (layout tagów 1–4) ---
+        z_meas_ts = self._side_meas_ts if alt_from_side else self._top_meas_ts
+        z_predicting = (now - z_meas_ts) <= max_h
+        # --- heading (for body-frame odometry and control) ---
         top_yaw_usable = top_usable and self._top_n >= int(self._stab.yaw_top_min_markers)
         side_yaw_usable = side_usable and self._has_side_heading
-
-        # Naucz przesunięcia SIDE->TOP, gdy oba kursy są dostępne (bezbolesny handoff).
         if top_yaw_usable and side_yaw_usable:
             target_off = self._unwrap_yaw(self._yaw - self._side_heading)
             if self._has_offset:
@@ -251,9 +309,6 @@ class PoseEstimator:
                 self._side_to_top_offset = target_off
                 self._has_offset = True
         aligned_side = self._unwrap_yaw(self._side_heading + self._side_to_top_offset)
-
-        # Kurs dla transformacji do układu ciała: zawsze preferuj TOP (ramka x/y),
-        # awaryjnie wyrównany kurs SIDE (tylko gdy poznano przesunięcie).
         if top_yaw_usable:
             heading_for_body = self._yaw
             heading_valid = True
@@ -263,8 +318,142 @@ class PoseEstimator:
         else:
             heading_for_body = self._yaw
             heading_valid = False
-
-        # Wejście sterujące yaw wg wybranego źródła.
+        # --- complementary odometry (optional; default: D-term only, not position) ---
+        odom_active, odom_vx, odom_vy, odom_vz = self._fuse_odometry(
+            odometry,
+            heading_rad=heading_for_body,
+            heading_valid=heading_valid,
+        )
+        top_age = now - self._top_meas_ts if self._has_top else 0.0
+        side_age = now - self._side_meas_ts if self._has_side else 0.0
+        if odom_active and self._odom_cfg.affect_filter:
+            if self._has_top and top_usable:
+                w = self._odom_blend_for_age(top_age)
+                self._blend_axis_velocity(self._fx, odom_vx, w, top_age)
+                self._blend_axis_velocity(self._fy, odom_vy, w, top_age)
+            if self._odom_cfg.fuse_altitude:
+                if alt_from_side and self._has_side and side_usable:
+                    wz = self._odom_blend_for_age(side_age)
+                    self._blend_axis_velocity(self._falt, odom_vz, wz, side_age)
+                elif not alt_from_side and self._has_top and top_usable:
+                    wz = self._odom_blend_for_age(top_age)
+                    self._blend_axis_velocity(self._ftop_z, odom_vz, wz, top_age)
+        # Predict position at current time (reduces delay, catches drift earlier).
+        use_predict_ctrl = bool(predict and getattr(self._cfg, "predict_for_control", False))
+        if self._has_top:
+            if use_predict_ctrl:
+                x_m = self._fx.predict(now, max_h)
+                y_m = self._fy.predict(now, max_h)
+                top_z = self._ftop_z.predict(now, max_h)
+            else:
+                x_m = self._fx.x if self._fx.x is not None else 0.0
+                y_m = self._fy.x if self._fy.x is not None else 0.0
+                top_z = self._ftop_z.x if self._ftop_z.x is not None else 0.0
+            vx, vy = self._fx.v, self._fy.v
+        else:
+            x_m = y_m = vx = vy = top_z = 0.0
+        if alt_from_side and self._has_side:
+            if use_predict_ctrl:
+                z_m = self._falt.predict(now, max_h)
+            else:
+                z_m = self._falt.x if self._falt.x is not None else 0.0
+            vz = self._falt.v
+            z_state, z_usable = side_state, side_usable
+        elif not alt_from_side and self._has_top:
+            z_m, vz = top_z, self._ftop_z.v
+            z_state, z_usable = top_state, top_usable
+        else:
+            z_m, vz = 0.0, 0.0
+            z_state, z_usable = side_state if alt_from_side else top_state, False
+        active: list[str] = []
+        freeze: list[str] = []
+        if top_usable:
+            active.extend(["x", "y"])
+            if top_state != TRACKING:
+                freeze.extend(["x", "y"])
+                vx = vy = 0.0
+            elif not top_predicting:
+                freeze.extend(["x", "y"])
+                vx = vy = 0.0
+        if z_usable:
+            active.append("z")
+            z_track = side_state if alt_from_side else top_state
+            if z_track != TRACKING:
+                freeze.append("z")
+                vz = 0.0
+            elif not z_predicting:
+                freeze.append("z")
+                vz = 0.0
+        if (
+            odom_active
+            and self._odom_cfg.use_for_derivative
+            and not self._odom_cfg.affect_filter
+        ):
+            w_cap = float(self._odom_cfg.derivative_blend_max)
+            if self._has_top and top_usable and top_state == TRACKING and top_age > 1e-6:
+                w = min(self._odom_blend_for_age(top_age), w_cap)
+                vx = (1.0 - w) * vx + w * odom_vx
+                vy = (1.0 - w) * vy + w * odom_vy
+            if self._odom_cfg.fuse_altitude:
+                if alt_from_side and self._has_side and side_usable and side_age > 1e-6:
+                    wz = min(self._odom_blend_for_age(side_age), w_cap)
+                    vz = (1.0 - wz) * vz + wz * odom_vz
+                elif not alt_from_side and self._has_top and top_usable and top_age > 1e-6:
+                    wz = min(self._odom_blend_for_age(top_age), w_cap)
+                    vz = (1.0 - wz) * vz + wz * odom_vz
+        side_u = side_v = side_area = side_z = side_x = 0.0
+        side_vu = side_vv = side_vz = side_vx = 0.0
+        top_u = top_v = 0.0
+        top_vu = top_vv = 0.0
+        side_predicting = (now - self._side_meas_ts) <= max_h
+        side_img = self._side_image_enabled(top_usable, side_usable, side_state)
+        top_img = self._top_image_enabled(top_usable, side_usable, top_state, side_state)
+        if bool(getattr(self._stab, "side_primary_horiz", False)) and (side_img or top_img):
+            active = [a for a in active if a not in ("x", "y")]
+            freeze = [a for a in freeze if a not in ("x", "y")]
+        if self._has_side:
+            side_x = self._fside_x.predict(now, max_h) if predict else (self._fside_x.x or 0.0)
+            side_z = self._fside_z.predict(now, max_h) if predict else (self._fside_z.x or 0.0)
+            side_vx, side_vz = self._fside_x.v, self._fside_z.v
+            if side_usable and side_img and getattr(self._stab, "side_pnp_hold", False):
+                active.append("side_x")
+                if bool(getattr(self._stab, "side_depth_hold", False)):
+                    active.append("side_depth")
+                if side_state != TRACKING or not side_predicting:
+                    freeze.append("side_x")
+                    if "side_depth" in active:
+                        freeze.append("side_depth")
+                    side_vx = side_vz = 0.0
+        if self._top_image_hold and self._has_top:
+            top_u = self._ftop_u.x if self._ftop_u.x is not None else 0.0
+            top_v = self._ftop_v.x if self._ftop_v.x is not None else 0.0
+            top_vu, top_vv = self._ftop_u.v, self._ftop_v.v
+            if top_usable and top_img:
+                active.extend(["top_u", "top_v"])
+                if top_state != TRACKING:
+                    freeze.extend(["top_u", "top_v"])
+                    top_vu = top_vv = 0.0
+        if self._side_image_hold and self._has_side:
+            side_u = self._fside_u.x if self._fside_u.x is not None else 0.0
+            side_v = self._fside_v.x if self._fside_v.x is not None else 0.0
+            side_area = self._fside_area.x if self._fside_area.x is not None else 0.0
+            side_vu, side_vv = self._fside_u.v, self._fside_v.v
+            if side_usable and side_img:
+                if getattr(self._stab, "side_hold_u", True):
+                    active.append("side_u")
+                    if side_state != TRACKING:
+                        freeze.append("side_u")
+                        side_vu = 0.0
+                if getattr(self._stab, "side_image_area_hold", False):
+                    active.append("side_depth")
+                    if side_state != TRACKING:
+                        freeze.append("side_depth")
+                if getattr(self._stab, "side_hold_v", False):
+                    active.append("side_v")
+                    if side_state != TRACKING:
+                        freeze.append("side_v")
+                        side_vv = 0.0
+        # Yaw control input per selected source.
         yaw_meas = self._yaw
         if self._use_yaw and self._yaw_source != "off":
             if self._yaw_source == "side":
@@ -291,11 +480,9 @@ class PoseEstimator:
                 active.append("yaw")
                 if not yaw_predicting:
                     freeze.append("yaw")
-
         valid = bool(active)
         tracking_state = self._overall_state(top_state, side_state if alt_from_side else top_state)
         age = now - self._top_meas_ts if self._has_top else 0.0
-
         hints = [h for h in (top.hint, side.hint) if h]
         return DroneState(
             valid=valid,
@@ -323,7 +510,68 @@ class PoseEstimator:
             measurement_age_s=age,
             marker_id=top.reference_marker_id,
             hint=" | ".join(hints) or None,
+            side_u_px=side_u,
+            side_v_px=side_v,
+            side_area_px=side_area,
+            side_z_m=side_z,
+            side_x_m=side_x,
+            side_vu_px_s=side_vu,
+            side_vv_px_s=side_vv,
+            side_vz_m_s=side_vz,
+            side_vx_m_s=side_vx,
+            side_marker_id=side.marker_id,
+            top_u_px=top_u,
+            top_v_px=top_v,
+            top_vu_px_s=top_vu,
+            top_vv_px_s=top_vv,
+            odom_fusion_active=odom_active,
+            odom_vx_m_s=odom_vx,
+            odom_vy_m_s=odom_vy,
+            odom_vz_m_s=odom_vz,
         )
+
+    def _odom_blend_for_age(self, meas_age_s: float) -> float:
+        cfg = self._odom_cfg
+        if meas_age_s <= 1e-6:
+            return 0.0
+        t = min(1.0, meas_age_s / max(float(cfg.stale_ramp_s), 1e-3))
+        lo = float(cfg.velocity_blend)
+        hi = float(cfg.velocity_blend_max)
+        return lo + (hi - lo) * t
+
+    @staticmethod
+    def _blend_axis_velocity(axis: AlphaBetaAxis, v_odom: float, blend: float, meas_age_s: float) -> None:
+        if axis.x is None or blend <= 0.0 or meas_age_s <= 1e-6:
+            return
+        w = float(np.clip(blend, 0.0, 1.0))
+        axis.v = float(np.clip((1.0 - w) * axis.v + w * v_odom, -axis.max_speed, axis.max_speed))
+
+    def _fuse_odometry(
+        self,
+        odometry: OdometrySample | None,
+        *,
+        heading_rad: float,
+        heading_valid: bool,
+    ) -> tuple[bool, float, float, float]:
+        cfg = self._odom_cfg
+        if not cfg.enabled or odometry is None or not odometry.valid:
+            return False, 0.0, 0.0, 0.0
+        if cfg.require_flying and not odometry.flying:
+            return False, 0.0, 0.0, 0.0
+        if cfg.require_heading and not heading_valid:
+            return False, 0.0, 0.0, 0.0
+        vmax = min(float(cfg.max_speed_m_s), float(self._cfg.max_speed_m_s))
+        fwd = float(np.clip(cfg.speed_x_sign * odometry.vx_m_s, -vmax, vmax))
+        lat = float(np.clip(cfg.speed_y_sign * odometry.vy_m_s, -vmax, vmax))
+        vz = float(np.clip(cfg.speed_z_sign * odometry.vz_m_s, -vmax, vmax))
+        db = max(0.0, float(cfg.deadband_m_s))
+        if max(abs(fwd), abs(lat), abs(vz)) < db:
+            return False, 0.0, 0.0, 0.0
+        c, s = float(np.cos(heading_rad)), float(np.sin(heading_rad))
+        # Match controller.py world<->body (yaw=0: forward=+y, lateral=+x).
+        vx_w = -s * fwd + c * lat
+        vy_w = c * fwd + s * lat
+        return True, vx_w, vy_w, vz
 
     @staticmethod
     def _overall_state(a: str, b: str) -> str:

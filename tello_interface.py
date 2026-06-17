@@ -1,4 +1,4 @@
-"""Komunikacja z Ryze Tello (djitellopy) + tryb symulacji bez sprzętu."""
+"""Ryze Tello communication (djitellopy) + hardware-free simulation mode."""
 from __future__ import annotations
 
 import logging
@@ -14,8 +14,18 @@ log = logging.getLogger(__name__)
 class TelloConfig:
     mock: bool = False
     auto_connect: bool = True
-    rc_send_hz: float = 15.0
+    rc_send_hz: float = 50.0
     telemetry_refresh_s: float = 1.0
+
+
+@dataclass
+class BodyVelocity:
+    """Tello-reported speed in body frame [m/s]: x=forward, y=lateral, z=up."""
+
+    vx_m_s: float = 0.0
+    vy_m_s: float = 0.0
+    vz_m_s: float = 0.0
+    valid: bool = False
 
 
 @dataclass
@@ -24,6 +34,7 @@ class TelemetrySnapshot:
     flying: bool = False
     battery: int | None = None
     current_rc: RCCommand = field(default_factory=RCCommand.zero)
+    body_velocity: BodyVelocity = field(default_factory=BodyVelocity)
     last_hover_reason: str = ""
     last_rc_sent_s: float = 0.0
 
@@ -31,7 +42,7 @@ class TelemetrySnapshot:
 class TelloController:
     """
     left_right = roll, forward_back = pitch, up_down = throttle, yaw = yaw
-    (zgodnie z djitellopy.send_rc_control).
+    (per djitellopy.send_rc_control).
     """
 
     def __init__(self, cfg: TelloConfig) -> None:
@@ -42,11 +53,12 @@ class TelloController:
         self._flying = False
         self._last_rc_sent_s = 0.0
         self._last_battery_refresh_s = 0.0
+        self._body_velocity = BodyVelocity()
         self._telemetry = TelemetrySnapshot()
 
     def connect(self) -> bool:
         if self._cfg.mock:
-            log.info("TelloInterface: tryb MOCK — brak połączenia z dronem.")
+            log.info("TelloInterface: MOCK mode — no drone connection.")
             self._connected = True
             self._mock_height_cm = 0
             self._flying = False
@@ -57,14 +69,14 @@ class TelloController:
         try:
             from djitellopy import Tello
         except ImportError as e:
-            log.error("Brak pakietu djitellopy: pip install djitellopy")
+            log.error("Missing djitellopy package: pip install djitellopy")
             raise e
 
         self._tello = Tello()
         self._tello.connect()
         self._connected = True
         self._refresh_telemetry(force=True)
-        log.info("Połączono z Tello, bateria: %s", self._telemetry.battery)
+        log.info("Connected to Tello, battery: %s", self._telemetry.battery)
         return True
 
     def disconnect(self) -> None:
@@ -95,6 +107,7 @@ class TelloController:
             flying=self._telemetry.flying,
             battery=self._telemetry.battery,
             current_rc=self._telemetry.current_rc,
+            body_velocity=self._body_velocity,
             last_hover_reason=self._telemetry.last_hover_reason,
             last_rc_sent_s=self._telemetry.last_rc_sent_s,
         )
@@ -126,7 +139,7 @@ class TelloController:
             self._mock_height_cm = 85
             self._flying = True
             self._telemetry.flying = True
-            log.info("MOCK takeoff — wysokość ~%s cm", self._mock_height_cm)
+            log.info("MOCK takeoff — height ~%s cm", self._mock_height_cm)
             return
         if self._tello:
             self._tello.takeoff()
@@ -146,14 +159,14 @@ class TelloController:
             self._telemetry.flying = False
 
     def emergency_stop(self) -> None:
-        """Natychmiastowe wyłączenie silników — używać ostrożnie."""
+        """Immediate motor shutdown — use with caution."""
         if self._cfg.mock:
             self._mock_height_cm = 0
             self._flying = False
             self._telemetry.flying = False
             self._telemetry.current_rc = RCCommand.zero()
             self._telemetry.last_hover_reason = "emergency"
-            log.warning("MOCK emergency — silniki zatrzymane (symulacja)")
+            log.warning("MOCK emergency — motors stopped (simulation)")
             return
         if self._tello:
             try:
@@ -166,7 +179,7 @@ class TelloController:
                 log.warning("emergency(): %s", e)
 
     def get_height_cm(self) -> int:
-        """Wysokość wg Tello (pole `h` w stanie, zwykle cm nad startem). MOCK: symulowane."""
+        """Height from Tello (`h` field in state, usually cm above takeoff). MOCK: simulated."""
         if self._cfg.mock or self._tello is None:
             return int(self._mock_height_cm)
         try:
@@ -177,6 +190,35 @@ class TelloController:
 
     def get_height_m(self) -> float:
         return self.get_height_cm() / 100.0
+
+    def get_body_velocity_m_s(self) -> BodyVelocity:
+        """Body-frame velocity from Tello SDK (cm/s -> m/s). MOCK: RC-derived estimate."""
+        self._refresh_body_velocity()
+        return self._body_velocity
+
+    def _refresh_body_velocity(self) -> None:
+        if not self._connected:
+            self._body_velocity = BodyVelocity()
+            return
+        if self._cfg.mock or self._tello is None:
+            rc = self._telemetry.current_rc
+            # Rough open-loop estimate for simulation (not for long dead reckoning).
+            scale = 0.012
+            self._body_velocity = BodyVelocity(
+                vx_m_s=float(rc.forward_back) * scale,
+                vy_m_s=float(rc.left_right) * scale,
+                vz_m_s=float(rc.throttle) * scale,
+                valid=bool(self._flying),
+            )
+            return
+        try:
+            vx = float(self._tello.get_speed_x()) / 100.0
+            vy = float(self._tello.get_speed_y()) / 100.0
+            vz = float(self._tello.get_speed_z()) / 100.0
+            self._body_velocity = BodyVelocity(vx_m_s=vx, vy_m_s=vy, vz_m_s=vz, valid=True)
+        except Exception as e:
+            log.debug("get_speed: %s", e)
+            self._body_velocity = BodyVelocity()
 
     def _refresh_telemetry(self, *, force: bool = False) -> None:
         self._telemetry.connected = self._connected

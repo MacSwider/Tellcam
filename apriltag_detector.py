@@ -1,4 +1,4 @@
-"""Detekcja AprilTag tag36h11 (ID 0–4) — pozycja i orientacja drona (TOP + SIDE)."""
+"""AprilTag tag36h11 detection (IDs 0–4) — drone position and orientation (TOP + SIDE)."""
 from __future__ import annotations
 
 import json
@@ -12,17 +12,15 @@ import numpy as np
 from config import AprilTagConfig, CameraConfig
 from fiducial_detector import FiducialDetection, FiducialDetector
 
-# Układ od góry (oś X = przód, Y = lewo):
-#   [1]     [2]
-#        [0]
-#   [4]      [3]
+# Lab frame (navigation, geofence): x=left (+), y=forward (+), z=up (+).
+# Tag body layout in solvePnP uses X=forward, Y=lateral on the drone.
 TOP_MARKER_IDS = frozenset({0, 1, 2, 3, 4})
 SIDE_MARKER_IDS = frozenset({1, 2, 3, 4})
 
 
 @dataclass(frozen=True)
 class MarkerOverlay:
-    """Obrys markera w pikselach klatki (do podglądu)."""
+    """Marker outline in frame pixels (for preview)."""
 
     marker_id: int
     corners: np.ndarray  # (4, 2) float
@@ -42,6 +40,8 @@ class TopPoseObservation:
     pose_quality: float = 0.0
     markers_seen: tuple[int, ...] = ()
     marker_overlays: Tuple[MarkerOverlay, ...] = ()
+    centroid_u_px: float = 0.0
+    centroid_v_px: float = 0.0
     hint: Optional[str] = None
 
 
@@ -52,11 +52,14 @@ class SideCorrectionObservation:
     y_m: float = 0.0
     z_m: float = 0.0
     yaw_rad: float = 0.0
-    # Kąt „zwrócenia” tagu do kamery bocznej: 0 = marker patrzy wprost na kamerę.
-    # Rośnie, gdy dron obraca się w yaw i marker zaczyna znikać z pola widzenia.
+    # Tag facing angle toward side camera: 0 = marker faces camera directly.
+    # Increases as the drone yaws and the marker leaves the field of view.
     yaw_facing_rad: float = 0.0
     marker_id: int | None = None
     image_area_px: float = 0.0
+    # Marker center in SIDE frame [px] — for holding the same image point.
+    centroid_u_px: float = 0.0
+    centroid_v_px: float = 0.0
     pose_quality: float = 0.0
     markers_seen: tuple[int, ...] = ()
     marker_overlays: Tuple[MarkerOverlay, ...] = ()
@@ -181,6 +184,15 @@ class AprilTagDetector:
         self._active_family = tag_cfg.family
         self._detection_mode = "none"
 
+    @property
+    def camera_matrix(self) -> np.ndarray:
+        """Intrinsic matrix K (for projecting world points to preview pixels)."""
+        return self._K
+
+    @property
+    def dist_coeffs(self) -> np.ndarray:
+        return self._dist
+
     def _build_body_centers(self) -> Dict[int, np.ndarray]:
         hf = float(self._tag.layout_half_forward_m)
         hl = float(self._tag.layout_half_lateral_m)
@@ -195,8 +207,8 @@ class AprilTagDetector:
 
     def _dict_hint(self) -> str:
         return (
-            f"Rodzina: {self._active_family}. "
-            f"Oczekiwane ID: {sorted(self._allowed_ids)}."
+            f"Family: {self._active_family}. "
+            f"Expected IDs: {sorted(self._allowed_ids)}."
         )
 
     def _ensure_intrinsics(self, w: int, h: int) -> None:
@@ -308,13 +320,13 @@ class AprilTagDetector:
 
     @staticmethod
     def _yaw_from_marker_image(pose: _MarkerPose) -> float:
-        """Kurs z KSZTAŁTU kwadratu w obrazie — kąt lokalnej osi +X markera.
+        """Heading from SQUARE SHAPE in image — angle of marker local +X axis.
 
-        Rogi z detektora mają stałą kolejność związaną z orientacją tagu
-        (obj pts: 0=(-h,+h), 1=(+h,+h), 2=(+h,-h), 3=(-h,-h)), więc krawędzie
-        0->1 oraz 3->2 wskazują lokalne +X. Dla widoku z góry to rotacja w
-        płaszczyźnie obrazu: jednoznaczna i odporna na flip-ambiguity PnP,
-        która przy pojedynczym tagu potrafiła skokowo zmieniać yaw.
+        Detector corners have fixed order tied to tag orientation
+        (obj pts: 0=(-h,+h), 1=(+h,+h), 2=(+h,-h), 3=(-h,-h)), so edges
+        0->1 and 3->2 point to local +X. For top-down view this is rotation in
+        the image plane: unambiguous and robust to PnP flip ambiguity that
+        could jump yaw with a single tag.
         """
         c = pose.corners.reshape(4, 2).astype(np.float64)
         ex = ((c[1] - c[0]) + (c[2] - c[3])) * 0.5
@@ -340,20 +352,30 @@ class AprilTagDetector:
                 return float(np.arctan2(d[1], d[0]))
         return None
 
+    def _tvec_to_lab(self, tvec: np.ndarray) -> tuple[float, float, float]:
+        """Camera tvec -> lab x=left, y=forward, z=up (height)."""
+        tv = np.asarray(tvec, dtype=np.float64).reshape(3)
+        ix = int(np.clip(self._tag.lab_x_tvec_index, 0, 2))
+        iy = int(np.clip(self._tag.lab_y_tvec_index, 0, 2))
+        x_m = float(self._tag.lab_x_sign) * float(tv[ix])
+        y_m = float(self._tag.lab_y_sign) * float(tv[iy])
+        z_m = float(abs(tv[2]))
+        return x_m, y_m, z_m
+
     def _hint_no_detection(self, all_seen: list[int]) -> str:
         base = self._dict_hint()
         if all_seen:
             return (
-                f"Wykryto inne ID: {all_seen} (nie 0–4) — prawdopodobnie zła rodzina lub fałszywe trafienia. {base}"
+                f"Detected other IDs: {all_seen} (not 0–4) — likely wrong family or false positives. {base}"
             )
         mm = int(round(self._tag.marker_length_m * 1000))
         return (
-            f"Brak tagów 0–4. Sprawdź ostrość, światło i rozmiar czarnego kwadratu ({mm} mm, bez ramki). {base}"
+            f"No tags 0–4. Check focus, lighting, and black square size ({mm} mm, no border). {base}"
         )
 
     def detect_top_pose(self, frame_bgr: Optional[np.ndarray]) -> TopPoseObservation:
         if frame_bgr is None or frame_bgr.size == 0:
-            return TopPoseObservation(ok=False, hint="Brak klatki TOP.")
+            return TopPoseObservation(ok=False, hint="No TOP frame.")
 
         poses, all_seen, overlays = self._detect_markers(frame_bgr)
         seen = tuple(sorted({p.id for p in poses}))
@@ -378,16 +400,17 @@ class AprilTagDetector:
                 ok=False,
                 markers_seen=seen,
                 marker_overlays=overlays,
-                hint=f"TOP: wykryto {seen}, ale estymacja pozy nieudana.",
+                hint=f"TOP: detected {seen}, but pose estimation failed.",
             )
 
         _, pitch, roll = _rotation_to_euler_zyx(R)
-        # Kurs liczymy z kształtu markera referencyjnego w obrazie (stabilny dla
-        # widoku z góry), a NIE z yaw PnP (flip-ambiguity przy 1 tagu).
+        # Heading from reference marker shape in image (stable for top-down view),
+        # NOT from PnP yaw (flip ambiguity with one tag).
         ref_pose = next((p for p in poses if p.id == reference_marker_id), poses[0])
         yaw = self._yaw_from_marker_image(ref_pose)
 
-        x_m, y_m, z_m = float(tvec[0]), float(tvec[1]), float(abs(tvec[2]))
+        x_m, y_m, z_m = self._tvec_to_lab(tvec)
+        cen = ref_pose.corners.reshape(-1, 2).mean(axis=0)
 
         ok_pose = len(seen) >= 1
         if not ok_pose:
@@ -403,7 +426,9 @@ class AprilTagDetector:
                 pose_quality=min(1.0, len(seen) / 2.0),
                 markers_seen=seen,
                 marker_overlays=overlays,
-                hint=f"TOP: za mało tagów ({seen}). Potrzebny ID 0 lub ≥2 ID.",
+                centroid_u_px=float(cen[0]),
+                centroid_v_px=float(cen[1]),
+                hint=f"TOP: too few tags ({seen}). Need ID 0 or ≥2 IDs.",
             )
 
         return TopPoseObservation(
@@ -418,12 +443,14 @@ class AprilTagDetector:
             pose_quality=min(1.0, len(seen) / 3.0 + (0.25 if 0 in seen else 0.0)),
             markers_seen=seen,
             marker_overlays=overlays,
-            hint="TOP: śledzenie względem TAG 0" if 0 in seen else f"TOP: śledzenie layoutu bez TAG 0 ({seen})",
+            centroid_u_px=float(cen[0]),
+            centroid_v_px=float(cen[1]),
+            hint="TOP: tracking relative to TAG 0" if 0 in seen else f"TOP: layout tracking without TAG 0 ({seen})",
         )
 
     def detect_side_correction(self, frame_bgr: Optional[np.ndarray]) -> SideCorrectionObservation:
         if frame_bgr is None or frame_bgr.size == 0:
-            return SideCorrectionObservation(ok=False, hint="Brak klatki SIDE.")
+            return SideCorrectionObservation(ok=False, hint="No SIDE frame.")
 
         poses, all_seen, overlays = self._detect_markers(frame_bgr)
         seen = tuple(sorted({p.id for p in poses}))
@@ -441,14 +468,15 @@ class AprilTagDetector:
 
         best = max(poses, key=_area)
         image_area_px = _area(best)
+        centroid = best.corners.reshape(-1, 2).mean(axis=0)
         frame_area = max(1.0, float(frame_bgr.shape[0] * frame_bgr.shape[1]))
         pose_quality = float(np.clip(image_area_px / (0.2 * frame_area), 0.0, 1.0))
         tvec = best.tvec.reshape(3)
         R, _ = cv2.Rodrigues(best.rvec.reshape(3, 1))
         yaw_corr = float(np.arctan2(R[1, 0], R[0, 0]))
-        # Normalna markera (+Z obiektu) w układzie kamery; gdy marker patrzy wprost
-        # na kamerę, normalna jest ~(0,0,-1). Kąt poziomy normalnej = obrót drona w yaw
-        # względem kamery bocznej (0 = tag zwrócony do kamery).
+        # Marker normal (+Z of object) in camera frame; when marker faces the
+        # camera directly, normal is ~(0,0,-1). Horizontal angle of normal = drone
+        # yaw relative to side camera (0 = tag facing camera).
         normal = R[:, 2]
         yaw_facing = float(np.arctan2(float(normal[0]), -float(normal[2])))
 
@@ -461,6 +489,8 @@ class AprilTagDetector:
             yaw_facing_rad=_unwrap_yaw(yaw_facing),
             marker_id=best.id,
             image_area_px=image_area_px,
+            centroid_u_px=float(centroid[0]),
+            centroid_v_px=float(centroid[1]),
             pose_quality=pose_quality,
             markers_seen=seen,
             marker_overlays=overlays,

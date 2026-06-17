@@ -1,4 +1,4 @@
-"""Launcher wyboru źródeł TOP/SIDE (styl OBS)."""
+"""TOP/SIDE source selection launcher (OBS-style)."""
 from __future__ import annotations
 
 import subprocess
@@ -7,7 +7,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-# Kolory zbliżone do ciemnego motywu (OBS)
+# Colors similar to dark theme (OBS)
 BG = "#1e1e1e"
 BG_PANEL = "#2d2d2d"
 FG = "#e8e8e8"
@@ -48,7 +48,7 @@ def _apply_dark_style(root: tk.Tk) -> ttk.Style:
 class DeviceBarApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
-        self.root.title("Tellcam — źródła TOP/SIDE")
+        self.root.title("Tellcam — TOP/SIDE sources")
         self.root.minsize(900, 280)
         _apply_dark_style(self.root)
 
@@ -58,7 +58,7 @@ class DeviceBarApp:
         outer = ttk.Frame(self.root, style="Bar.TFrame", padding=8)
         outer.pack(fill=tk.BOTH, expand=True)
 
-        title = ttk.Label(outer, text="Tellcam · wybór źródeł TOP i SIDE", style="Bar.TLabel")
+        title = ttk.Label(outer, text="Tellcam · TOP and SIDE source selection", style="Bar.TLabel")
         title.pack(anchor=tk.W, pady=(0, 6))
         self.top_ui = self._build_source_row(outer, "TOP")
         self.side_ui = self._build_source_row(outer, "SIDE")
@@ -66,11 +66,11 @@ class DeviceBarApp:
         row2 = ttk.Frame(outer, style="Bar.TFrame")
         row2.pack(fill=tk.X, pady=8)
 
-        ttk.Label(row2, text="Maks. szerokość podglądu:", style="Bar.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(row2, text="Max preview width:", style="Bar.TLabel").pack(side=tk.LEFT, padx=(0, 6))
         self.preview_w_var = tk.IntVar(value=1400)
         ttk.Spinbox(row2, from_=0, to=3840, textvariable=self.preview_w_var, width=8).pack(side=tk.LEFT)
 
-        ttk.Label(row2, text="  Tryb: TOP pozycja nad TAG 0 + SIDE wysokość", style="Bar.TLabel").pack(
+        ttk.Label(row2, text="  Mode: TOP position over TAG 0 + SIDE altitude", style="Bar.TLabel").pack(
             side=tk.LEFT, padx=(16, 4)
         )
 
@@ -82,7 +82,7 @@ class DeviceBarApp:
         self.btn_stop = ttk.Button(row3, text="■ Stop", command=self._stop, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=4)
 
-        self.status = ttk.Label(outer, text="Gotowe. Wybierz źródło i Start.", style="Bar.TLabel")
+        self.status = ttk.Label(outer, text="Ready. Select sources and Start.", style="Bar.TLabel")
         self.status.pack(anchor=tk.W, pady=(8, 0))
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -98,18 +98,18 @@ class DeviceBarApp:
             bar,
             state="readonly",
             width=22,
-            values=("Kamera USB", "Ekran (monitor)", "Okno aplikacji"),
+            values=("USB camera", "Screen (monitor)", "Application window"),
         )
         source_combo.current(0)
         source_combo.pack(side=tk.LEFT, padx=4)
-        detail_label = ttk.Label(bar, text="Urządzenie:", style="Bar.TLabel")
+        detail_label = ttk.Label(bar, text="Device:", style="Bar.TLabel")
         detail_label.pack(side=tk.LEFT, padx=(8, 4))
         detail_combo = ttk.Combobox(bar, state="readonly", width=54)
         detail_combo.pack(side=tk.LEFT, padx=4)
         filter_var = tk.StringVar()
         filter_entry = ttk.Entry(bar, textvariable=filter_var, width=20)
         filter_entry.pack(side=tk.LEFT, padx=6)
-        ttk.Button(bar, text="Odśwież", command=lambda: self._refresh_detail(ui)).pack(side=tk.LEFT, padx=8)
+        ttk.Button(bar, text="Refresh", command=lambda: self._refresh_detail(ui)).pack(side=tk.LEFT, padx=8)
         ui = {
             "name": label.lower(),
             "source_combo": source_combo,
@@ -131,11 +131,11 @@ class DeviceBarApp:
     def _on_source_change(self, ui: dict) -> None:
         mode = self._capture_mode(ui)
         if mode == "usb":
-            ui["detail_label"].configure(text="Kamera:")
+            ui["detail_label"].configure(text="Camera:")
         elif mode == "screen":
             ui["detail_label"].configure(text="Monitor:")
         else:
-            ui["detail_label"].configure(text="Okno:")
+            ui["detail_label"].configure(text="Window:")
         self._refresh_detail(ui)
 
     def _refresh_detail(self, ui: dict) -> None:
@@ -150,14 +150,14 @@ class DeviceBarApp:
             ids = probe_usb_camera_indices()
             if ids:
                 ui["detail_values"] = ids
-                ui["detail_combo"]["values"] = [f"Kamera {i}" for i in ids]
+                ui["detail_combo"]["values"] = [f"Camera {i}" for i in ids]
                 if ui["name"] == "side" and len(ids) > 1:
                     ui["detail_combo"].current(1)
                 else:
                     ui["detail_combo"].current(0)
             else:
                 ui["detail_values"] = []
-                ui["detail_combo"]["values"] = ["(brak wykrytych kamer USB)"]
+                ui["detail_combo"]["values"] = ["(no USB cameras detected)"]
                 ui["detail_combo"].set(ui["detail_combo"]["values"][0])
         elif mode == "screen":
             try:
@@ -173,7 +173,7 @@ class DeviceBarApp:
             try:
                 titles = list_window_titles(300)
             except RuntimeError as e:
-                messagebox.showerror("Okna", str(e))
+                messagebox.showerror("Windows", str(e))
                 ui["detail_combo"]["values"] = []
                 return
             filt = ui["filter_var"].get().strip().lower()
@@ -186,7 +186,7 @@ class DeviceBarApp:
                 ui["detail_combo"].current(0)
             else:
                 ui["detail_values"] = []
-                ui["detail_combo"]["values"] = ["(brak okien — odśwież lub zmień filtr)"]
+                ui["detail_combo"]["values"] = ["(no windows — refresh or change filter)"]
                 ui["detail_combo"].set(ui["detail_combo"]["values"][0])
         self._avoid_same_usb_defaults()
 
@@ -220,14 +220,14 @@ class DeviceBarApp:
 
         if mode == "usb":
             if not values:
-                raise ValueError("Brak kamer USB — podłącz urządzenie i kliknij Odśwież.")
+                raise ValueError("No USB cameras — connect a device and click Refresh.")
             cur = combo.current()
             if cur < 0 or cur >= len(values):
                 cur = 0
             argv += [f"--{prefix}-camera-index", str(values[cur])]
         elif mode == "screen":
             if not values:
-                raise ValueError("Brak monitorów w konfiguracji mss.")
+                raise ValueError("No monitors in mss configuration.")
             cur = combo.current()
             if cur < 0 or cur >= len(values):
                 cur = min(1, len(values) - 1) if len(values) > 1 else 0
@@ -235,7 +235,7 @@ class DeviceBarApp:
         else:
             title = values[combo.current()] if values else ""
             if not title or title.startswith("("):
-                raise ValueError("Wybierz okno z listy.")
+                raise ValueError("Select a window from the list.")
             argv += [f"--{prefix}-window-title", title]
 
     def _build_argv(self) -> list[str]:
@@ -246,14 +246,14 @@ class DeviceBarApp:
         self._append_source_args(argv, self.side_ui)
         pw = int(self.preview_w_var.get())
         if pw < 0:
-            raise ValueError("Maks. szerokość podglądu nie może być ujemna.")
+            raise ValueError("Max preview width cannot be negative.")
         argv += ["--preview-max-width", str(pw)]
 
         return argv
 
     def _start(self) -> None:
         if self._proc and self._proc.poll() is None:
-            messagebox.showinfo("Tellcam", "Proces już działa — najpierw Stop.")
+            messagebox.showinfo("Tellcam", "Process already running — Stop first.")
             return
         try:
             argv = self._build_argv()
@@ -261,10 +261,10 @@ class DeviceBarApp:
             messagebox.showwarning("Tellcam", str(e))
             return
         except (tk.TclError, TypeError) as e:
-            messagebox.showwarning("Tellcam", f"Niepoprawna wartość pola: {e}")
+            messagebox.showwarning("Tellcam", f"Invalid field value: {e}")
             return
 
-        self.status.configure(text="Uruchamianie: " + " ".join(argv[2:]))
+        self.status.configure(text="Starting: " + " ".join(argv[2:]))
         try:
             self._proc = subprocess.Popen(
                 argv,
@@ -272,7 +272,7 @@ class DeviceBarApp:
                 creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0,
             )
         except Exception as e:
-            messagebox.showerror("Tellcam", f"Nie udało się uruchomić:\n{e}")
+            messagebox.showerror("Tellcam", f"Failed to start:\n{e}")
             self._proc = None
             return
 
@@ -290,18 +290,18 @@ class DeviceBarApp:
         self._proc = None
         self.btn_start.configure(state=tk.NORMAL)
         self.btn_stop.configure(state=tk.DISABLED)
-        self.status.configure(text=f"Proces zakończony (kod {code}).")
+        self.status.configure(text=f"Process finished (code {code}).")
 
     def _stop(self) -> None:
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
-            self.status.configure(text="Wysłano zatrzymanie procesu.")
+            self.status.configure(text="Sent process stop signal.")
         self.btn_start.configure(state=tk.NORMAL)
         self.btn_stop.configure(state=tk.DISABLED)
 
     def _on_close(self) -> None:
         if self._proc and self._proc.poll() is None:
-            if not messagebox.askokcancel("Tellcam", "Trwa przetwarzanie. Zamknąć launcher i zatrzymać podgląd?"):
+            if not messagebox.askokcancel("Tellcam", "Processing in progress. Close launcher and stop preview?"):
                 return
             self._proc.terminate()
         self.root.destroy()

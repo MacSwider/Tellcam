@@ -1,10 +1,10 @@
 """
-Wielowątkowy pipeline wizji Tellcam: kamery, detekcja AprilTag, sterowanie, podgląd.
+Multi-threaded Tellcam vision pipeline: cameras, AprilTag detection, control, preview.
 
-- CameraReader: tylko read() @ max FPS, nadpisuje najnowszą klatkę
-- AprilTagDetectionWorker: detekcja @ stałej częstotliwości na najświeższej klatce
-- ControlLoop (wątek główny): PID / fuzja @ control_hz, bez detekcji tagów
-- PreviewGUI: podgląd @ preview_hz, bez detekcji
+- CameraReader: read() only @ max FPS, overwrites latest frame
+- AprilTagDetectionWorker: detection @ fixed rate on freshest frame
+- ControlLoop (main thread): PID / fusion @ control_hz, no tag detection
+- PreviewGUI: preview @ preview_hz, no detection
 """
 from __future__ import annotations
 
@@ -24,8 +24,9 @@ from apriltag_detector import (
     SideCorrectionObservation,
     TopPoseObservation,
 )
-from config import AppConfig, CameraConfig, PipelineConfig as ConfigPipelineConfig
-from state_estimator import DroneState, StateEstimator
+from config import AppConfig, CameraConfig, PipelineConfig as ConfigPipelineConfig, apriltag_for_role
+from flight_hud import FlightHudSnapshot, draw_flight_hud
+from state_estimator import DroneState, OdometrySample, StateEstimator
 from video_source import VideoSource
 
 log = logging.getLogger(__name__)
@@ -42,6 +43,8 @@ class FrameSlot:
     frame: Optional[np.ndarray] = None
     timestamp: float = 0.0
     seq: int = 0
+    width: int = 0
+    height: int = 0
 
 
 @dataclass
@@ -52,7 +55,7 @@ class MarkerOverlaySlot:
 
 @dataclass
 class PoseSlot:
-    """Ostatnia obserwacja pozy (dane do sterowania)."""
+    """Latest pose observation (data for control)."""
     top: TopPoseObservation = field(default_factory=lambda: TopPoseObservation(ok=False))
     side: SideCorrectionObservation = field(default_factory=lambda: SideCorrectionObservation(ok=False))
     top_timestamp: float = 0.0
@@ -62,7 +65,18 @@ class PoseSlot:
 
 
 @dataclass
+class TrajectoryOverlay:
+    """Route elements projected to pixels (TOP camera) for preview drawing."""
+    waypoints_px: List[Tuple[int, int]] = field(default_factory=list)
+    start_px: Optional[Tuple[int, int]] = None
+    drone_px: Optional[Tuple[int, int]] = None
+    current_index: int = 0
+    total: int = 0
+
+
+@dataclass
 class StatusSnapshot:
+    hud: FlightHudSnapshot = field(default_factory=FlightHudSnapshot)
     lines: List[str] = field(default_factory=list)
     control_hz: float = 0.0
     top_detection_hz: float = 0.0
@@ -75,7 +89,7 @@ class StatusSnapshot:
 
 
 class VisionSharedState:
-    """Współdzielony stan między wątkami (lock per slot)."""
+    """Shared state between threads (lock per slot)."""
 
     def __init__(self) -> None:
         self._frame_locks = {TOP: threading.Lock(), SIDE: threading.Lock()}
@@ -94,6 +108,16 @@ class VisionSharedState:
         self.ui_events: queue.Queue[str] = queue.Queue(maxsize=16)
         self.button_rect: Tuple[int, int, int, int] = (0, 0, 0, 0)
         self._button_lock = threading.Lock()
+        self._traj_lock = threading.Lock()
+        self.trajectory: Optional[TrajectoryOverlay] = None
+
+    def publish_trajectory(self, overlay: Optional[TrajectoryOverlay]) -> None:
+        with self._traj_lock:
+            self.trajectory = overlay
+
+    def peek_trajectory(self) -> Optional[TrajectoryOverlay]:
+        with self._traj_lock:
+            return self.trajectory
 
     def set_button_rect(self, rect: Tuple[int, int, int, int]) -> None:
         with self._button_lock:
@@ -109,6 +133,7 @@ class VisionSharedState:
             slot.frame = frame
             slot.timestamp = time.perf_counter()
             slot.seq += 1
+            slot.height, slot.width = int(frame.shape[0]), int(frame.shape[1])
 
     def snapshot_frame(self, camera_id: str) -> Tuple[Optional[np.ndarray], float, int]:
         with self._frame_locks[camera_id]:
@@ -118,7 +143,7 @@ class VisionSharedState:
             return slot.frame.copy(), slot.timestamp, slot.seq
 
     def peek_frame(self, camera_id: str) -> Tuple[Optional[np.ndarray], float]:
-        """Podgląd: kopia klatki bez blokowania detekcji długo."""
+        """Preview: frame copy without blocking detection for long."""
         with self._frame_locks[camera_id]:
             slot = self.frames[camera_id]
             if slot.frame is None:
@@ -159,6 +184,7 @@ class VisionSharedState:
     def read_status(self) -> StatusSnapshot:
         with self._status_lock:
             return StatusSnapshot(
+                hud=self.status.hud,
                 lines=list(self.status.lines),
                 control_hz=self.status.control_hz,
                 top_detection_hz=self.status.top_detection_hz,
@@ -172,7 +198,7 @@ class VisionSharedState:
 
 
 class CameraReader(threading.Thread):
-    """Wątek kamery: wyłącznie read() @ max FPS, nadpisanie najnowszej klatki."""
+    """Camera thread: read() only @ max FPS, overwrite latest frame."""
 
     def __init__(
         self,
@@ -208,7 +234,7 @@ class CameraReader(threading.Thread):
                     fps_n = 0
                     fps_t0 = now
         except Exception:
-            log.exception("[%s] CameraReader błąd", self.name)
+            log.exception("[%s] CameraReader error", self.name)
         finally:
             if self._source:
                 self._source.close()
@@ -220,7 +246,7 @@ class CameraReader(threading.Thread):
 
 
 class AprilTagDetectionWorker(threading.Thread):
-    """Wątek detekcji: stała częstotliwość, zawsze najświeższa klatka z CameraReader."""
+    """Detection thread: fixed rate, always freshest frame from CameraReader."""
 
     def __init__(
         self,
@@ -246,6 +272,16 @@ class AprilTagDetectionWorker(threading.Thread):
         self.detection_hz = 0.0
         self.last_detect_ms = 0.0
         self._slow_warn_t = 0.0
+        self.last_input_width = 0
+        self.last_input_height = 0
+
+    @property
+    def camera_matrix(self) -> np.ndarray:
+        return self._detector.camera_matrix
+
+    @property
+    def dist_coeffs(self) -> np.ndarray:
+        return self._detector.dist_coeffs
 
     def _detect(self, frame: np.ndarray) -> Union[TopPoseObservation, SideCorrectionObservation]:
         if self._mode == TOP:
@@ -268,6 +304,7 @@ class AprilTagDetectionWorker(threading.Thread):
                 t0 = time.perf_counter()
                 frame, _, _ = self._shared.snapshot_frame(self._camera_id)
                 if frame is not None:
+                    self.last_input_height, self.last_input_width = int(frame.shape[0]), int(frame.shape[1])
                     obs = self._detect(frame)
                     self._publish(obs)
                     self.detection_count += 1
@@ -277,7 +314,7 @@ class AprilTagDetectionWorker(threading.Thread):
                 if elapsed > self._period * 1.5 and (time.perf_counter() - self._slow_warn_t) > 5.0:
                     self._slow_warn_t = time.perf_counter()
                     log.warning(
-                        "[%s] detekcja wolna: %.0f ms (limit ~%.0f ms @ %.1f Hz, frame=%sx%s)",
+                        "[%s] slow detection: %.0f ms (limit ~%.0f ms @ %.1f Hz, frame=%sx%s)",
                         self.name,
                         self.last_detect_ms,
                         self._period * 1000.0,
@@ -295,13 +332,13 @@ class AprilTagDetectionWorker(threading.Thread):
                     fps_n = 0
                     fps_t0 = now
         except Exception:
-            log.exception("[%s] AprilTagDetectionWorker błąd", self.name)
+            log.exception("[%s] AprilTagDetectionWorker error", self.name)
         finally:
             log.info("[%s] AprilTagDetectionWorker stop (detections=%s)", self.name, self.detection_count)
 
 
 class ControlLoop:
-    """Pętla sterowania @ control_hz — tylko odczyt pozy ze współdzielonego stanu."""
+    """Control loop @ control_hz — reads pose from shared state only."""
 
     def __init__(
         self,
@@ -309,7 +346,8 @@ class ControlLoop:
         pipeline_cfg: PipelineConfig,
         estimator: StateEstimator,
         *,
-        on_tick: Optional[Callable[[DroneState, TopPoseObservation, SideCorrectionObservation, float], List[str]]] = None,
+        on_tick: Optional[Callable[[DroneState, TopPoseObservation, SideCorrectionObservation, float], FlightHudSnapshot]] = None,
+        odometry_provider: Optional[Callable[[], OdometrySample | None]] = None,
         top_detection: Optional[AprilTagDetectionWorker] = None,
         side_detection: Optional[AprilTagDetectionWorker] = None,
         top_camera: Optional[CameraReader] = None,
@@ -319,6 +357,7 @@ class ControlLoop:
         self._period = 1.0 / max(pipeline_cfg.control_hz, 1.0)
         self._estimator = estimator
         self._on_tick = on_tick
+        self._odometry_provider = odometry_provider
         self._top_detection = top_detection
         self._side_detection = side_detection
         self._top_camera = top_camera
@@ -338,10 +377,18 @@ class ControlLoop:
 
             now = time.perf_counter()
             top_obs, side_obs, top_ts, side_ts = self._shared.read_poses()
-            state = self._estimator.update(top_obs, side_obs, top_ts=top_ts, side_ts=side_ts, now=now)
-            lines: List[str] = []
+            odom: OdometrySample | None = None
+            if self._odometry_provider is not None:
+                try:
+                    odom = self._odometry_provider()
+                except Exception:
+                    log.debug("odometry_provider failed", exc_info=True)
+            state = self._estimator.update(
+                top_obs, side_obs, top_ts=top_ts, side_ts=side_ts, now=now, odometry=odom
+            )
+            hud = FlightHudSnapshot()
             if self._on_tick:
-                lines = self._on_tick(state, top_obs, side_obs, dt)
+                hud = self._on_tick(state, top_obs, side_obs, dt)
 
             with self._shared._frame_locks[TOP]:
                 top_frame_ts = self._shared.frames[TOP].timestamp
@@ -349,7 +396,7 @@ class ControlLoop:
                 side_frame_ts = self._shared.frames[SIDE].timestamp
 
             snap = StatusSnapshot(
-                lines=lines,
+                hud=hud,
                 control_hz=self.control_hz,
                 top_detection_hz=self._top_detection.detection_hz if self._top_detection else 0.0,
                 side_detection_hz=self._side_detection.detection_hz if self._side_detection else 0.0,
@@ -384,7 +431,7 @@ def draw_marker_overlays(
     max_age_s: float = 0.5,
     overlay_age_s: float = 0.0,
 ) -> np.ndarray:
-    """Rysuje obrysy markerów na kopii klatki (wątek podglądu, bez detekcji)."""
+    """Draw marker outlines on frame copy (preview thread, no detection)."""
     if not overlays or overlay_age_s > max_age_s:
         return frame_bgr
     out = frame_bgr.copy()
@@ -406,15 +453,54 @@ def draw_marker_overlays(
     return out
 
 
+def draw_trajectory_overlay(frame_bgr: np.ndarray, ov: Optional[TrajectoryOverlay]) -> np.ndarray:
+    """Draw planned route on TOP frame: line, points, numbers, current target."""
+    if ov is None or not ov.waypoints_px:
+        return frame_bgr
+    out = frame_bgr
+    # Polyline: start -> successive waypoints.
+    chain: List[Tuple[int, int]] = []
+    if ov.start_px is not None:
+        chain.append(ov.start_px)
+    chain.extend(ov.waypoints_px)
+    for i in range(len(chain) - 1):
+        cv2.line(out, chain[i], chain[i + 1], (210, 200, 60), 2, cv2.LINE_AA)
+    # Start point.
+    if ov.start_px is not None:
+        cv2.drawMarker(out, ov.start_px, (255, 170, 40), cv2.MARKER_TRIANGLE_UP, 16, 2)
+        cv2.putText(out, "S", (ov.start_px[0] + 8, ov.start_px[1] + 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 170, 40), 2, cv2.LINE_AA)
+    # Waypoints: reached (green), current (yellow, larger), future (gray).
+    for idx, p in enumerate(ov.waypoints_px):
+        if idx < ov.current_index:
+            color = (90, 200, 90)
+        elif idx == ov.current_index:
+            color = (0, 215, 255)
+        else:
+            color = (170, 170, 170)
+        radius = 10 if idx == ov.current_index else 6
+        cv2.circle(out, p, radius, color, -1, cv2.LINE_AA)
+        cv2.circle(out, p, radius, (20, 20, 20), 1, cv2.LINE_AA)
+        cv2.putText(out, str(idx + 1), (p[0] + 9, p[1] - 9),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+    # Drone + line to current target.
+    if ov.drone_px is not None:
+        cv2.drawMarker(out, ov.drone_px, (0, 0, 255), cv2.MARKER_CROSS, 18, 2)
+        if 0 <= ov.current_index < len(ov.waypoints_px):
+            cv2.line(out, ov.drone_px, ov.waypoints_px[ov.current_index],
+                     (0, 140, 255), 1, cv2.LINE_AA)
+    return out
+
+
 class PreviewGUI(threading.Thread):
-    """Podgląd @ preview_hz — resize/imshow + obrysy z ostatniej detekcji."""
+    """Preview @ preview_hz — resize/imshow + outlines from last detection."""
 
     def __init__(
         self,
         shared: VisionSharedState,
         pipeline_cfg: PipelineConfig,
         *,
-        window_name: str = "Tellcam — TOP | SIDE | terminal",
+        window_name: str = "Tellcam — TOP | SIDE",
         top_label: str = "TOP",
         side_label: str = "SIDE",
         preview_max_width: int = 1400,
@@ -443,8 +529,8 @@ class PreviewGUI(threading.Thread):
     def _on_mouse(self, event, x, y, flags, param) -> None:
         del flags, param
         if event == cv2.EVENT_LBUTTONDOWN:
-            # Współrzędne kliknięcia są w przestrzeni wyświetlanego (przeskalowanego)
-            # obrazu — przelicz na współrzędne panelu, w których zapisano przyciski.
+            # Click coordinates are in displayed (scaled) image space —
+            # convert to panel coordinates where buttons were stored.
             scale = self._disp_scale if self._disp_scale > 0 else 1.0
             x = int(x / scale)
             y = int(y / scale)
@@ -463,10 +549,41 @@ class PreviewGUI(threading.Thread):
         return frame
 
     @staticmethod
-    def _add_source_bar(frame: np.ndarray, label: str) -> np.ndarray:
+    def _pad_to_height(frame: np.ndarray, target_h: int) -> np.ndarray:
+        h, w = frame.shape[:2]
+        if h == target_h:
+            return frame
+        if h < target_h:
+            pad = target_h - h
+            top = pad // 2
+            bottom = pad - top
+            return cv2.copyMakeBorder(
+                frame, top, bottom, 0, 0, cv2.BORDER_CONSTANT, value=(24, 24, 24)
+            )
+        scale = target_h / float(h)
+        return cv2.resize(
+            frame,
+            (max(1, int(w * scale)), target_h),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    @staticmethod
+    def _add_source_bar(frame: np.ndarray, label: str, *, size_tag: str = "") -> np.ndarray:
         bar_h = 30
         bar = np.full((bar_h, frame.shape[1], 3), (45, 45, 45), dtype=np.uint8)
         cv2.putText(bar, label, (10, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 2, cv2.LINE_AA)
+        if size_tag:
+            tx = int(max(10, int(frame.shape[1]) - 220))
+            cv2.putText(
+                bar,
+                size_tag,
+                (tx, 21),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (160, 220, 160),
+                1,
+                cv2.LINE_AA,
+            )
         return cv2.vconcat([bar, frame])
 
     def _frame_for_preview(self, camera_id: str, live: np.ndarray) -> np.ndarray:
@@ -502,35 +619,33 @@ class PreviewGUI(threading.Thread):
                     side_frame = self._placeholder_frame("SIDE disabled" if not self._side_enabled else "SIDE waiting...")
 
                 top_disp = self._frame_for_preview(TOP, top_frame)
+                if self._show_overlay and self._top_enabled:
+                    top_disp = draw_trajectory_overlay(top_disp, self._shared.peek_trajectory())
                 side_disp = self._frame_for_preview(SIDE, side_frame)
-                left = self._add_source_bar(top_disp, self._top_label)
-                right = self._add_source_bar(side_disp, self._side_label)
-                h = min(left.shape[0], right.shape[0])
-                lw = cv2.resize(left, (int(left.shape[1] * h / left.shape[0]), h))
-                rw = cv2.resize(right, (int(right.shape[1] * h / right.shape[0]), h))
-                cameras_panel = cv2.hconcat([lw, rw])
+                top_size = f"{top_frame.shape[1]}×{top_frame.shape[0]}"
+                side_size = f"{side_frame.shape[1]}×{side_frame.shape[0]}"
+                left = self._add_source_bar(top_disp, self._top_label, size_tag=top_size)
+                right = self._add_source_bar(side_disp, self._side_label, size_tag=side_size)
+                panel_h = max(left.shape[0], right.shape[0])
+                cameras_panel = cv2.hconcat(
+                    [self._pad_to_height(left, panel_h), self._pad_to_height(right, panel_h)]
+                )
 
-                header = [
-                    f"preview={self.preview_hz:.1f}Hz control={status.control_hz:.1f}Hz",
-                    (
-                        f"det top={status.top_detection_hz:.1f}Hz side={status.side_detection_hz:.1f}Hz "
-                        f"frame_age top={status.top_frame_age_s:.2f}s side={status.side_frame_age_s:.2f}s"
-                    ),
-                ]
-                all_lines = header + status.lines
-                term_h = max(220, 26 * (len(all_lines) + 3))
-                terminal = np.zeros((term_h, cameras_panel.shape[1], 3), dtype=np.uint8)
-                self._draw_overlay(terminal, all_lines)
+                hud = status.hud
+                hud.preview_hz = self.preview_hz
+                hud.control_hz = status.control_hz
+                terminal = draw_flight_hud(cameras_panel.shape[1], hud)
+                term_h = terminal.shape[0]
 
                 if self._control_enabled:
                     button_specs = [
-                        ("connect", "Connect", (70, 70, 180)),
-                        ("takeoff", "Takeoff", (0, 140, 0)),
+                        ("takeoff", "Start", (0, 140, 0)),
+                        ("travel", "Travel", (150, 90, 0)),
                         ("land", "Land", (0, 120, 200)),
-                        ("emergency", "EMERGENCY", (0, 0, 220)),
+                        ("emergency", "STOP", (0, 0, 220)),
                     ]
-                    btn_w, btn_h, gap = 150, 40, 12
-                    by0 = max(8, term_h - btn_h - 10)
+                    btn_w, btn_h, gap = 130, 36, 10
+                    by0 = max(8, term_h - btn_h - 8)
                     total_w = len(button_specs) * btn_w + (len(button_specs) - 1) * gap
                     bx = max(10, terminal.shape[1] - total_w - 10)
                     self.button_rects = {}
@@ -585,7 +700,7 @@ class PreviewGUI(threading.Thread):
                 if sleep_s > 0 and not self._shared.stop.wait(timeout=sleep_s):
                     pass
         except Exception:
-            log.exception("PreviewGUI błąd")
+            log.exception("PreviewGUI error")
         finally:
             cv2.destroyWindow(self._window_name)
             log.info("PreviewGUI stop")
@@ -593,7 +708,7 @@ class PreviewGUI(threading.Thread):
 
 @dataclass
 class VisionPipeline:
-    """Uruchamia wątki i blokuje na ControlLoop w wątku głównym."""
+    """Starts worker threads and blocks on ControlLoop in the main thread."""
 
     shared: VisionSharedState
     top_camera: Optional[CameraReader]
@@ -632,12 +747,13 @@ def build_vision_pipeline(
     pipeline_cfg: PipelineConfig,
     top_source_factory: Optional[Callable[[], VideoSource]],
     side_source_factory: Callable[[], VideoSource],
-    on_control_tick: Callable[[DroneState, TopPoseObservation, SideCorrectionObservation, float], List[str]],
+    on_control_tick: Callable[[DroneState, TopPoseObservation, SideCorrectionObservation, float], FlightHudSnapshot],
     *,
     preview_enabled: bool = True,
     top_label: str = "TOP",
     side_label: str = "SIDE",
     preview_max_width: int = 1400,
+    odometry_provider: Optional[Callable[[], OdometrySample | None]] = None,
 ) -> VisionPipeline:
     shared = VisionSharedState()
     top_camera: Optional[CameraReader] = None
@@ -649,7 +765,7 @@ def build_vision_pipeline(
             TOP,
             pipeline_cfg.detection_hz_top,
             shared,
-            cfg.apriltag,
+            apriltag_for_role(cfg, TOP),
             cfg.cameras,
             mode=TOP,
         )
@@ -659,7 +775,7 @@ def build_vision_pipeline(
         SIDE,
         pipeline_cfg.detection_hz_side,
         shared,
-        cfg.apriltag,
+        apriltag_for_role(cfg, SIDE),
         cfg.cameras,
         mode=SIDE,
     )
@@ -668,6 +784,7 @@ def build_vision_pipeline(
         pipeline_cfg,
         StateEstimator(cfg.tracking, cfg.stabilization),
         on_tick=on_control_tick,
+        odometry_provider=odometry_provider,
         top_detection=top_detection,
         side_detection=side_detection,
         top_camera=top_camera,
@@ -696,6 +813,6 @@ def build_vision_pipeline(
     )
 
 
-# Alias wsteczny (stara nazwa wątku detekcji)
+# Backward-compatible alias (legacy detection thread name)
 ArucoDetectionWorker = AprilTagDetectionWorker
 ArucoDetectorThread = AprilTagDetectionWorker
