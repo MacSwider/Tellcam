@@ -1,10 +1,10 @@
 {
-  "_comment": "Przyklad sciezki lotu. Kroki WZGLEDNE w ukladzie ciala drona (widok z gory). 1.0 = 1 metr (skala navigation.units_to_meter). turn_deg dodatni = obrot w lewo (CCW). Aktywne, gdy navigation.mode = 'path'.",
-  "steps": [
-    { "forward_m": 1.0 },
-    { "turn_deg": 90.0 },
-    { "forward_m": 1.0, "hold_s": 1.0 },
-    { "turn_deg": -90.0, "up_m": 0.3 },
-    { "forward_m": 0.5, "left_m": 0.5 }
+  "_comment": "Absolute lab coordinates. TOP frame: X=left (+), Y=forward (+), Z=up (+). Units: cm (100 = 1 m). Four corners at the same altitude — square ~50 cm.",
+  "coordinate_unit": "cm",
+  "points": [
+    { "X": 0, "Y": 0, "Z": 100 },
+    { "X": 50, "Y": 0, "Z": 100 },
+    { "X": 50, "Y": 50, "Z": 100 },
+    { "X": 0, "Y": 50, "Z": 100 }
   ]
 }

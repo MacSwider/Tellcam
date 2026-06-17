@@ -1,0 +1,5 @@
+{
+  "type": "square_clockwise",
+  "side_m": 0.5,
+  "comment": "Clockwise square in body frame: forward, right, back, left. Omit side_m to use navigation.square_side_m from config."
+}
