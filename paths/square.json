@@ -1,0 +1,15 @@
+{
+  "name": "Kwadrat 60 cm",
+  "points": [
+    { "x": -0.30, "y": -0.30, "z": 1.0 },
+    { "x":  0.30, "y": -0.30, "z": 1.0 },
+    { "x":  0.30, "y":  0.30, "z": 1.0 },
+    { "x": -0.30, "y":  0.30, "z": 1.0 }
+  ],
+  "closed": true,
+  "loop": false,
+  "helper_spacing_m": 0.15,
+  "acceptance_radius_m": 0.08,
+  "helper_acceptance_radius_m": 0.15,
+  "hold_at_main_s": 1.0
+}

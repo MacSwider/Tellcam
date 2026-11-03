@@ -82,6 +82,17 @@ def _load_intrinsics(path: str, w: int, h: int) -> Tuple[np.ndarray, np.ndarray]
     return camera_matrix, dist
 
 
+def camera_intrinsics_for_frame(
+    tag_cfg: AprilTagConfig, cam_cfg: CameraConfig, w: int, h: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Te same parametry kamery, których używa AprilTagDetector dla klatki w×h."""
+    if tag_cfg.calibration_path:
+        return _load_intrinsics(tag_cfg.calibration_path, cam_cfg.width, cam_cfg.height)
+    if tag_cfg.intrinsics_from_frame_size:
+        return _default_intrinsics(w, h)
+    return _default_intrinsics(cam_cfg.width, cam_cfg.height)
+
+
 def _rotation_to_euler_zyx(rmat: np.ndarray) -> tuple[float, float, float]:
     sy = np.sqrt(rmat[0, 0] ** 2 + rmat[1, 0] ** 2)
     singular = sy < 1e-6

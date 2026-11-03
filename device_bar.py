@@ -40,6 +40,8 @@ def _apply_dark_style(root: tk.Tk) -> ttk.Style:
     )
     style.map("TCombobox", fieldbackground=[("readonly", "#3a3a3a")])
     style.configure("TSpinbox", fieldbackground="#3a3a3a", foreground=FG)
+    style.configure("TCheckbutton", background=BG, foreground=FG, font=("Segoe UI", 10))
+    style.map("TCheckbutton", background=[("active", BG)])
     style.configure("TButton", background=ACCENT, foreground=FG, padding=6, font=("Segoe UI", 10, "bold"))
     style.map("TButton", background=[("active", "#4a6aaa")])
     return style
@@ -70,7 +72,12 @@ class DeviceBarApp:
         self.preview_w_var = tk.IntVar(value=1400)
         ttk.Spinbox(row2, from_=0, to=3840, textvariable=self.preview_w_var, width=8).pack(side=tk.LEFT)
 
-        ttk.Label(row2, text="  Tryb: AprilTag TOP+SIDE", style="Bar.TLabel").pack(side=tk.LEFT, padx=(16, 4))
+        self.control_var = tk.BooleanVar(value=True)
+        self.mock_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row2, text="Sterowanie Tello (START/LAND)", variable=self.control_var).pack(
+            side=tk.LEFT, padx=(16, 4)
+        )
+        ttk.Checkbutton(row2, text="Symulacja (bez drona)", variable=self.mock_var).pack(side=tk.LEFT, padx=4)
 
         row3 = ttk.Frame(outer, style="Bar.TFrame")
         row3.pack(fill=tk.X, pady=8)
@@ -246,6 +253,10 @@ class DeviceBarApp:
         if pw < 0:
             raise ValueError("Maks. szerokość podglądu nie może być ujemna.")
         argv += ["--preview-max-width", str(pw)]
+        if self.control_var.get():
+            argv.append("--control")
+        if self.mock_var.get():
+            argv.append("--mock-tello")
 
         return argv
 

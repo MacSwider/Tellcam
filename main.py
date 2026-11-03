@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import queue
 import sys
@@ -10,10 +11,13 @@ import cv2
 
 from config import AppConfig, load_config
 from controller import DroneController
+from flight_mission import AIRBORNE_PHASES, FlightMission
+from flight_path import load_path
+from position_filter import PositionFilter, tello_velocity_to_camera
 from state_estimator import DroneState
 from tello_interface import TelloConfig, TelloInterface
 from video_source import create_video_source
-from vision_pipeline import PipelineConfig, build_vision_pipeline
+from vision_pipeline import FlightUiState, PipelineConfig, build_vision_pipeline
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +26,8 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Tellcam — nawigacja AprilTag TOP/SIDE + (opcjonalnie) Tello")
     p.add_argument("--config", type=str, default=None, help="JSON z nadpisaniami configu")
     p.add_argument("--no-control", action="store_true", help="Wyłącz RC do drona (tylko detekcja / podgląd)")
+    p.add_argument("--control", action="store_true", help="Włącz sterowanie Tello (przyciski START/LAND)")
+    p.add_argument("--path", type=str, default=None, help="Plik JSON z trasą (domyślnie flight.path_file)")
     p.add_argument(
         "--connect-tello",
         action="store_true",
@@ -64,6 +70,8 @@ def _source_label(kind: str, args: argparse.Namespace) -> str:
 
 
 def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
+    if args.control:
+        cfg.control_enabled = True
     if args.no_control:
         cfg.control_enabled = False
     if args.no_windows:
@@ -101,11 +109,26 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
         preview_hz=cfg.pipeline.preview_hz,
     )
 
-    controller = DroneController(cfg.controller, cfg.target)
+    path_file = args.path or cfg.flight.path_file
+    try:
+        flight_path = load_path(path_file)
+    except Exception as e:
+        log.error("Trasa %s: %s", path_file, e)
+        return 1
+    log.info(
+        "Trasa „%s”: %d punktów głównych, %d z pomocniczymi",
+        flight_path.name,
+        len(flight_path.main_points),
+        len(flight_path.points),
+    )
+
+    controller = DroneController(cfg.controller)
     tello = TelloInterface(TelloConfig(mock=args.mock_tello))
-    lost_frames = 0
-    failsafe_active = False
-    flight_active = False
+    mission = FlightMission(cfg.flight, tello, controller, flight_path)
+    path_ui_points = tuple((p.xyz, p.is_main) for p in flight_path.points)
+    last_depth_m: float | None = None
+    pos_filter = PositionFilter(cfg.filter)
+    last_valid_state: DroneState | None = None
 
     def _ensure_tello() -> bool:
         if tello.connected:
@@ -115,7 +138,7 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
             log.info("Połączono z Tello")
             return True
         except Exception as e:
-            log.error("Tello: %s", e)
+            log.error("Tello: %s: %s — sprawdź Wi-Fi TELLO-* i czy dron jest włączony", type(e).__name__, e)
             return False
 
     if cfg.control_enabled and args.connect_tello:
@@ -123,77 +146,81 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
             log.warning("Brak Tello przy starcie — START spróbuje ponownie.")
 
     def on_control_tick(state: DroneState, top_obs, side_obs, dt: float) -> list[str]:
-        nonlocal lost_frames, failsafe_active, flight_active
+        nonlocal last_depth_m, last_valid_state
+
+        pipeline = on_control_tick._pipeline  # type: ignore[attr-defined]
+        shared = pipeline.shared
+        _, _, top_ts, side_ts = shared.read_poses()
+        while True:
+            try:
+                cmd = shared.ui_commands.get_nowait()
+            except queue.Empty:
+                break
+            if not cfg.control_enabled:
+                log.info("START/LAND wyłączone (tryb detekcji)")
+            elif cmd == "takeoff":
+                if _ensure_tello():
+                    mission.request_takeoff()
+                else:
+                    log.error("START: brak połączenia z Tello")
+            elif cmd == "land":
+                mission.request_land()
+
+        if state.valid:
+            last_valid_state = state
+            last_depth_m = state.z_m
+
+        raw_vel = tello.velocity() if tello.connected else None
+        filter_line = ""
+        ctl_state, vel_xy = state, None
+        if cfg.filter.enabled:
+            vel_meas = None
+            if cfg.filter.use_tello_velocity and raw_vel is not None and last_valid_state is not None:
+                vel_meas = tello_velocity_to_camera(
+                    raw_vel[0], raw_vel[1], last_valid_state.yaw_rad, cfg.filter, cfg.controller.heading_offset_rad
+                )
+            fs = pos_filter.step(dt, state.valid, (state.x_m, state.y_m), top_ts, vel_meas)
+            if fs.valid and last_valid_state is not None:
+                # Podczas predykcji (brak świeżej detekcji) yaw i odległość z ostatniej poprawnej pozy.
+                ctl_state = dataclasses.replace(last_valid_state, valid=True, x_m=fs.x_m, y_m=fs.y_m)
+                vel_xy = (fs.vx_mps, fs.vy_mps)
+            else:
+                ctl_state = dataclasses.replace(state, valid=False)
+            filter_line = (
+                f"filtr: x={fs.x_m:+.2f} y={fs.y_m:+.2f} vx={fs.vx_mps:+.2f} vy={fs.vy_mps:+.2f} m/s "
+                f"predykcja={fs.predicted_s:.2f}s"
+            )
+        if raw_vel is not None:
+            filter_line += f" | tello vgx={raw_vel[0]} vgy={raw_vel[1]}"
+
+        mission_lines = mission.tick(ctl_state, dt, vel_xy) if cfg.control_enabled and tello.connected else []
+        shared.set_flight_ui(
+            FlightUiState(
+                phase=mission.phase.value,
+                airborne=mission.phase in AIRBORNE_PHASES,
+                path_points=path_ui_points,
+                target_index=mission.follower.index if mission.phase.value in ("FOLLOW", "FINISHED") else -1,
+                drone_xy=(ctl_state.x_m, ctl_state.y_m) if ctl_state.valid else None,
+                depth_m=last_depth_m,
+            )
+        )
 
         status_lines = [
-            f"valid={state.valid} top={top_obs.ok} side={side_obs.ok}",
+            f"valid={state.valid} top={top_obs.ok} side={side_obs.ok} "
             f"top_ids={list(top_obs.markers_seen)} side_ids={list(side_obs.markers_seen)}",
-            f"x={state.x_m:.2f} y={state.y_m:.2f} z={state.z_m:.2f}",
-            f"yaw={state.yaw_rad:.2f} pitch={state.pitch_rad:.2f} roll={state.roll_rad:.2f}",
-            f"failsafe={failsafe_active} lost={lost_frames}",
-            f"control={cfg.control_enabled} tello={'OK' if tello.connected else '—'}",
+            f"x={state.x_m:+.2f} y={state.y_m:+.2f} dist_cam={state.z_m:.2f} yaw={state.yaw_rad:+.2f}",
+            f"control={cfg.control_enabled} tello={'OK' if tello.connected else '—'} trasa={flight_path.name}",
         ]
+        if filter_line:
+            status_lines.append(filter_line)
+        status_lines += mission_lines
+        if not cfg.control_enabled:
+            status_lines.append("tryb detekcji (bez sterowania dronem)")
         if top_obs.hint:
             status_lines.append(f"top_hint={top_obs.hint}")
         if side_obs.hint:
             status_lines.append(f"side_hint={side_obs.hint}")
-        if cfg.control_enabled:
-            status_lines.append(f"flight={'ON' if flight_active else 'OFF'} (START/LAND)")
-        else:
-            status_lines.append("tryb detekcji (bez sterowania dronem)")
 
-        pipeline = on_control_tick._pipeline  # type: ignore[attr-defined]
-        shared = pipeline.shared
-        while True:
-            try:
-                cx, cy = shared.mouse_clicks.get_nowait()
-            except queue.Empty:
-                break
-            x0, y0, x1, y1 = shared.get_button_rect()
-            if x0 <= cx <= x1 and y0 <= cy <= y1:
-                if not cfg.control_enabled:
-                    log.info("START/LAND wyłączone (tryb detekcji)")
-                elif not _ensure_tello():
-                    log.error("START/LAND: brak połączenia z Tello")
-                elif not flight_active:
-                    tello.takeoff()
-                    flight_active = True
-                    controller.reset()
-                    log.info("START — takeoff")
-                else:
-                    tello.send_rc_zero()
-                    tello.land()
-                    flight_active = False
-                    controller.reset()
-                    log.info("LAND — lądowanie")
-
-        if state.valid:
-            lost_frames = 0
-            if failsafe_active:
-                failsafe_active = False
-                controller.reset()
-                log.info("Detekcja przywrócona — wznowienie PID")
-            if flight_active and cfg.control_enabled and tello.connected:
-                cmd = controller.compute(state.x_m, state.y_m, state.z_m, state.yaw_rad, dt)
-                tello.send_rc(cmd)
-                status_lines.append(f"RC r={cmd.roll} p={cmd.pitch} thr={cmd.throttle} y={cmd.yaw}")
-        else:
-            lost_frames += 1
-            if not failsafe_active:
-                log.warning("Utrata pełnej detekcji — RC=0")
-                failsafe_active = True
-            controller.reset()
-            if (
-                flight_active
-                and cfg.failsafe.on_lost_send_zero_rc
-                and cfg.control_enabled
-                and tello.connected
-            ):
-                tello.send_rc_zero()
-            if lost_frames >= cfg.failsafe.max_lost_frames and lost_frames % 30 == 0:
-                log.warning("Brak detekcji przez %s klatek", lost_frames)
-
-        _, _, top_ts, side_ts = shared.read_poses()
         now = time.perf_counter()
         status_lines.append(
             f"pose_age top={now - top_ts:.2f}s side={now - side_ts:.2f}s "
@@ -240,12 +267,8 @@ def run_vision_stack(cfg: AppConfig, args: argparse.Namespace) -> int:
         log.info("Przerwano przez użytkownika")
     finally:
         if tello.connected:
+            mission.shutdown()
             tello.send_rc_zero()
-            if flight_active:
-                try:
-                    tello.land()
-                except Exception:
-                    pass
         tello.disconnect()
         cv2.destroyAllWindows()
 

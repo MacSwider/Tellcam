@@ -2,31 +2,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
 
 import numpy as np
 
-from config import ControllerConfig, PIDGains, TargetConfig
+from config import ControllerConfig, PIDGains
 
 
 class PID:
     def __init__(self, gains: PIDGains) -> None:
         self.g = gains
         self._i = 0.0
-        self._prev_e = 0.0
+        self._prev_e: float | None = None
 
     def reset(self) -> None:
         self._i = 0.0
-        self._prev_e = 0.0
+        self._prev_e = None
 
-    def step(self, error: float, dt: float) -> float:
+    def step(self, error: float, dt: float, rate: float | None = None) -> float:
+        """rate: zmierzona prędkość w kierunku błędu (z filtra); wtedy D = -kd * rate."""
         if dt <= 0:
             dt = 1e-3
         p = self.g.kp * error
         self._i += self.g.ki * error * dt
         lim = self.g.integral_limit
         self._i = float(np.clip(self._i, -lim, lim))
-        d = self.g.kd * (error - self._prev_e) / dt
+        if rate is not None:
+            d = -self.g.kd * rate
+        else:
+            d = 0.0 if self._prev_e is None else self.g.kd * (error - self._prev_e) / dt
         self._prev_e = error
         u = p + self._i + d
         return float(np.clip(u, -self.g.output_limit, self.g.output_limit))
@@ -40,27 +43,22 @@ class RCCommand:
     yaw: int
 
 
+ZERO_RC = RCCommand(0, 0, 0, 0)
+
+
 class DroneController:
     """
-    Błędy: ex = target.x - x, itd.
-    Znaki wyjść można dopasować do układu współrzędnych / montażu kamer.
+    XY i yaw w układzie kamery TOP (x w prawo, y w dół obrazu, yaw rośnie zgodnie z ruchem
+    wskazówek zegara patrząc z góry), wysokość = wysokość nad podłogą.
+    RC Tello: roll + = w prawo, pitch + = do przodu, throttle + = w górę, yaw + = w prawo.
     """
 
-    def __init__(self, cfg: ControllerConfig, target: TargetConfig) -> None:
+    def __init__(self, cfg: ControllerConfig) -> None:
         self._cfg = cfg
-        self._target = target
         self.pid_x = PID(cfg.pid_x)
         self.pid_y = PID(cfg.pid_y)
         self.pid_z = PID(cfg.pid_z)
         self.pid_yaw = PID(cfg.pid_yaw)
-        # Znaki: strojenie pod rzeczywisty układ Tello + kamery
-        self.sign_roll = 1
-        self.sign_pitch = 1
-        self.sign_throttle = 1
-        self.sign_yaw_cmd = 1
-
-    def set_target(self, target: TargetConfig) -> None:
-        self._target = target
 
     def reset(self) -> None:
         self.pid_x.reset()
@@ -68,31 +66,70 @@ class DroneController:
         self.pid_z.reset()
         self.pid_yaw.reset()
 
-    def compute(self, x_m: float, y_m: float, z_m: float, yaw_rad: float, dt: float) -> RCCommand:
-        ex = self._target.x_m - x_m
-        ey = self._target.y_m - y_m
-        ez = self._target.z_m - z_m
-        eyaw = self._angle_diff(self._target.yaw_rad, yaw_rad)
+    def _deadzone(self, e: float, dz: float) -> float:
+        return 0.0 if abs(e) < dz else e
 
-        if abs(ex) < self._cfg.deadzone_m:
-            ex = 0.0
-        if abs(ey) < self._cfg.deadzone_m:
-            ey = 0.0
-        if abs(ez) < self._cfg.deadzone_m:
-            ez = 0.0
-        if abs(eyaw) < self._cfg.deadzone_yaw_rad:
-            eyaw = 0.0
+    def altitude_only(self, target_alt_m: float, alt_m: float, dt: float) -> RCCommand:
+        ez = self._deadzone(target_alt_m - alt_m, self._cfg.deadzone_m)
+        throttle = self._cfg.sign_throttle * self.pid_z.step(ez, dt)
+        return RCCommand(0, 0, _q(throttle), 0)
 
-        roll = self.sign_roll * self.pid_x.step(ex, dt)
-        pitch = self.sign_pitch * self.pid_y.step(ey, dt)
-        throttle = self.sign_throttle * self.pid_z.step(ez, dt)
-        yaw = self.sign_yaw_cmd * self.pid_yaw.step(eyaw, dt)
+    def compute(
+        self,
+        target_xyz: tuple[float, float, float],
+        target_yaw_rad: float | None,
+        x_m: float,
+        y_m: float,
+        alt_m: float,
+        yaw_rad: float,
+        dt: float,
+        vel_xy: tuple[float, float] | None = None,
+        basis: tuple[tuple[float, float], tuple[float, float]] | None = None,
+    ) -> RCCommand:
+        """basis: zmierzone kierunki (przód, prawo) drona w układzie kamery — ma pierwszeństwo przed yaw."""
+        cfg = self._cfg
+        ex = target_xyz[0] - x_m
+        ey = target_xyz[1] - y_m
+        ez = self._deadzone(target_xyz[2] - alt_m, cfg.deadzone_m)
 
-        def q(v: float) -> int:
-            return int(np.clip(round(v), -100, 100))
+        if basis is not None:
+            (fx, fy), (rx, ry) = basis
 
-        return RCCommand(roll=q(roll), pitch=q(pitch), throttle=q(throttle), yaw=q(yaw))
+            def to_body(ax: float, ay: float) -> tuple[float, float]:
+                return ax * fx + ay * fy, ax * rx + ay * ry
+        elif cfg.body_frame:
+            heading = yaw_rad + cfg.heading_offset_rad
+            c, s = np.cos(heading), np.sin(heading)
 
-    @staticmethod
-    def _angle_diff(target: float, current: float) -> float:
-        return float(np.arctan2(np.sin(target - current), np.cos(target - current)))
+            def to_body(ax: float, ay: float) -> tuple[float, float]:
+                return ax * c + ay * s, -ax * s + ay * c
+        else:
+
+            def to_body(ax: float, ay: float) -> tuple[float, float]:
+                return -ay, ax
+
+        e_fwd, e_right = to_body(ex, ey)
+        v_fwd, v_right = to_body(*vel_xy) if vel_xy is not None else (None, None)
+
+        if np.hypot(e_fwd, e_right) < cfg.deadzone_m:
+            e_fwd = e_right = 0.0
+
+        # Zmierzona baza już zawiera znaki osi — sign_roll/sign_pitch tylko dla trybu z yaw.
+        sr, sp = (1, 1) if basis is not None else (cfg.sign_roll, cfg.sign_pitch)
+        roll = sr * self.pid_x.step(e_right, dt, v_right)
+        pitch = sp * self.pid_y.step(e_fwd, dt, v_fwd)
+        throttle = cfg.sign_throttle * self.pid_z.step(ez, dt)
+        yaw = 0.0
+        if target_yaw_rad is not None:
+            eyaw = self._deadzone(_angle_diff(target_yaw_rad, yaw_rad), cfg.deadzone_yaw_rad)
+            yaw = cfg.sign_yaw * self.pid_yaw.step(eyaw, dt)
+
+        return RCCommand(roll=_q(roll), pitch=_q(pitch), throttle=_q(throttle), yaw=_q(yaw))
+
+
+def _q(v: float) -> int:
+    return int(np.clip(round(v), -100, 100))
+
+
+def _angle_diff(target: float, current: float) -> float:
+    return float(np.arctan2(np.sin(target - current), np.cos(target - current)))

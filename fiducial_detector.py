@@ -1,5 +1,5 @@
 """
-Detekcja markerów AprilTag (rodzina tag36h11) — pupil_apriltags:
+Detekcja markerów AprilTag (rodzina tag36h11) — cv2.aruco (DICT_APRILTAG_*):
   wieloprzebiegowy (CLAHE / histogram), skalowanie dla małych klatek,
   fallback dla naklejek bez białej ramki (wycięcie czarnego kwadratu + pad),
   filtr ID 0–4, deduplikacja i walidacja geometryczna układu.
@@ -10,9 +10,26 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
-from pupil_apriltags import Detector
 
 from config import AprilTagConfig
+
+_APRILTAG_DICTS = {
+    "tag16h5": cv2.aruco.DICT_APRILTAG_16h5,
+    "tag25h9": cv2.aruco.DICT_APRILTAG_25h9,
+    "tag36h10": cv2.aruco.DICT_APRILTAG_36h10,
+    "tag36h11": cv2.aruco.DICT_APRILTAG_36h11,
+    # Klasyczne ArUco: siatka 6×6 pól (z ramką) zamiast 8×8 w tag36h11 → większe pola przy tym samym
+    # rozmiarze naklejki, czyli detekcja z większej odległości.
+    "aruco_4x4_50": cv2.aruco.DICT_4X4_50,
+    "aruco_5x5_50": cv2.aruco.DICT_5X5_50,
+}
+
+
+def marker_dictionary(family: str):
+    key = family.lower()
+    if key not in _APRILTAG_DICTS:
+        raise ValueError(f"Nieobsługiwana rodzina markerów: {family} (dostępne: {', '.join(_APRILTAG_DICTS)})")
+    return cv2.aruco.getPredefinedDictionary(_APRILTAG_DICTS[key])
 
 
 @dataclass
@@ -112,14 +129,12 @@ class FiducialDetector:
         self._tag = tag_cfg
         self._allowed = sorted(int(x) for x in tag_cfg.marker_ids)
         self._allowed_set = set(self._allowed)
-        self._detector = Detector(
-            families=tag_cfg.family,
-            nthreads=1,
-            quad_decimate=float(tag_cfg.quad_decimate),
-            quad_sigma=float(tag_cfg.quad_sigma),
-            refine_edges=1 if tag_cfg.refine_edges else 0,
-            decode_sharpening=float(tag_cfg.decode_sharpening),
+        dictionary = marker_dictionary(tag_cfg.family)
+        params = cv2.aruco.DetectorParameters()
+        params.cornerRefinementMethod = (
+            cv2.aruco.CORNER_REFINE_SUBPIX if tag_cfg.refine_edges else cv2.aruco.CORNER_REFINE_NONE
         )
+        self._detector = cv2.aruco.ArucoDetector(dictionary, params)
 
     def _filter_allowed(
         self, corners: list | None, ids: np.ndarray | None
@@ -179,20 +194,19 @@ class FiducialDetector:
     def _collect_detections(
         self,
         gray: np.ndarray,
-        margin_thr: float,
         remap: tuple[int, int, int, int] | None = None,
     ) -> tuple[list, list[int]]:
         """Zbierz trafienia z bieżącej skali obrazu (opcjonalnie z patch → pełna klatka)."""
         corners: list = []
         ids_list: list[int] = []
-        detections = self._detector.detect(gray)
-        for det in detections:
-            if det.decision_margin is not None and float(det.decision_margin) < margin_thr:
-                continue
-            mid = int(det.tag_id)
+        det_corners, det_ids, _rejected = self._detector.detectMarkers(gray)
+        if det_ids is None:
+            return corners, ids_list
+        for raw_c, raw_id in zip(det_corners, det_ids.flatten()):
+            mid = int(raw_id)
             if mid not in self._allowed_set:
                 continue
-            c = _corners_to_opencv_order(det.corners)
+            c = _corners_to_opencv_order(raw_c)
             if remap is not None:
                 x0, y0, pad_px, upscale = remap
                 c = _remap_corners_from_patch(c, x0, y0, pad_px, upscale)
@@ -209,13 +223,11 @@ class FiducialDetector:
         scales = [1.0]
         if min(h, w) < 280:
             scales.append(2.0)
-        margin_thr = float(self._tag.min_decision_margin)
-
         for scale in scales:
             g = gray if scale == 1.0 else cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
             inv = 1.0 / scale
             for variant in _gray_variants(g, self._tag):
-                corners, ids_list = self._collect_detections(variant, margin_thr)
+                corners, ids_list = self._collect_detections(variant)
                 if not ids_list:
                     continue
                 ids_arr = np.array([[x] for x in ids_list], dtype=np.int32)
@@ -257,7 +269,7 @@ class FiducialDetector:
                         interpolation=cv2.INTER_CUBIC,
                     )
                     remap = (x0, y0, pad_px, upscale)
-                    corners, ids_list = self._collect_detections(up, margin_thr, remap=remap)
+                    corners, ids_list = self._collect_detections(up, remap=remap)
                     if not ids_list:
                         continue
                     ids_arr = np.array([[x] for x in ids_list], dtype=np.int32)

@@ -96,18 +96,35 @@ class UsbCeilingSource(VideoSource):
         self._cap: Optional[cv2.VideoCapture] = None
 
     def open(self) -> None:
+        cfg = self._cfg
+        params = [cv2.CAP_PROP_FRAME_WIDTH, int(cfg.width), cv2.CAP_PROP_FRAME_HEIGHT, int(cfg.height)]
+        if cfg.fourcc:
+            params = [cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*cfg.fourcc[:4])] + params
+        if cfg.fps:
+            params += [cv2.CAP_PROP_FPS, int(cfg.fps)]
+
         def _open(idx: int) -> cv2.VideoCapture:
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW, params)
             if cap.isOpened():
                 return cap
             cap.release()
-            return cv2.VideoCapture(idx)
+            cap = cv2.VideoCapture(idx)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.height)
+            return cap
 
         self._cap = _open(self._index)
         if not self._cap.isOpened():
             raise RuntimeError(f"Nie otwarto kamery USB (index={self._index})")
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._cfg.width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._cfg.height)
+        if cfg.exposure is not None:
+            self._cap.set(cv2.CAP_PROP_EXPOSURE, float(cfg.exposure))
+        log.info(
+            "Kamera USB %s: %dx%d, backend=%s",
+            self._index,
+            int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            self._cap.getBackendName(),
+        )
         buf = int(self._cfg.buffer_size)
         if buf > 0:
             self._cap.set(cv2.CAP_PROP_BUFFERSIZE, buf)
